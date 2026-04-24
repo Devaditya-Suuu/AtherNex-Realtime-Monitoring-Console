@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "athernex",
+			"path": "."
+		},
+		{
+			"name": "model",
+			"path": "../../Downloads/model"
+		}
+	],
+	"settings": {}
+}

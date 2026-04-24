@@ -1,15 +1,18 @@
-# AtherNex - Realtime Monitoring Console
+# AtherNex - Red Team vs Blue Team Realtime Demo
 
-A professional cybersecurity anomaly detection system with a real-time monitoring dashboard. The project combines a FastAPI backend with a React frontend featuring animated UI, live threat feeds, and staged attack simulations.
+AtherNex now runs as two real applications talking over live HTTP traffic:
+
+- Red Team app launches real attack patterns.
+- Blue Team app receives that traffic, scores threat risk with AegisAI, and auto-blocks abusive sources.
 
 ## Features
 
-- **Real-time Threat Detection**: Uses trained anomaly detection models to identify suspicious network patterns
-- **Interactive Dashboard**: React-based UI with Recharts for data visualization
-- **Live Updates**: Streaming log feed with animated entries
-- **Attack Simulation**: Staged attack simulation for demo and testing purposes
-- **Dark Theme**: Professional dark-themed interface with GSAP animations
-- **Multi-metric Analysis**: Monitors response time, CPU usage, memory, status codes, and retry patterns
+- **Two-App Architecture**: Independent Red Team attacker app and Blue Team defense app.
+- **Real HTTP Attack Traffic**: Brute force, DDoS-like flood, SQL injection probes, and port scanning.
+- **Realtime Detection + Blocking**: Protected target endpoints are monitored and blocked automatically on high-risk behavior.
+- **Live Security Telemetry APIs**: Event stream, blocklist, and source overview.
+- **Interactive Blue Team Dashboard**: React + GSAP + Recharts UI with real-traffic mode.
+- **Model-Based Risk Scoring**: Uses bundled model artifacts (scaler MVP path) to classify request patterns.
 
 ## Tech Stack
 
@@ -17,7 +20,13 @@ A professional cybersecurity anomaly detection system with a real-time monitorin
 - **Framework**: FastAPI
 - **Language**: Python 3.13
 - **ML**: scikit-learn (StandardScaler for inference)
-- **Port**: 8001
+- **Port**: 8001 (Blue Team target + defense)
+
+### Red Team App
+- **Framework**: FastAPI
+- **Language**: Python 3.13
+- **HTTP Client**: httpx (async burst traffic)
+- **Port**: 8002
 
 ### Frontend
 - **Framework**: React 18.3
@@ -43,11 +52,22 @@ source .venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the backend
+# Run the Blue Team backend
 python main.py
 ```
 
-The backend will start on `http://localhost:8001`
+Blue Team backend will start on `http://localhost:8001`
+
+### Red Team App Setup
+
+Use the same Python virtual environment as backend.
+
+```bash
+source .venv/bin/activate
+python red_team_app.py
+```
+
+Red Team app will start on `http://localhost:8002`
 
 ### Frontend Setup
 
@@ -67,33 +87,66 @@ The frontend will start on `http://localhost:5173`
 npm run build
 ```
 
-## API Endpoints
+## Blue Team API Endpoints
 
 - `GET /health` - Health check endpoint
 - `POST /predict` - Get threat prediction for given metrics
 - `GET /simulate-attack` - Simulate a staged attack scenario
 - `GET /debug/model-info` - Get model artifact information
 
-## Running Both Services
+### Protected target endpoints (receive real attack traffic)
 
-Terminal 1 (Backend):
+- `POST /target/login`
+- `GET /target/ping`
+- `GET /target/search?q=...`
+- `GET /target/ports/{port}`
+
+### Security telemetry endpoints
+
+- `GET /security/events?limit=120`
+- `GET /security/overview`
+- `GET /security/blocklist`
+- `POST /security/unblock/{source}`
+- `POST /security/reset`
+
+## Running All Apps
+
+Terminal 1 (Blue Team backend):
 ```bash
 source .venv/bin/activate
 python main.py
 ```
 
-Terminal 2 (Frontend):
+Terminal 2 (Frontend dashboard):
 ```bash
 npm run dev
 ```
 
-Then open `http://localhost:5173` in your browser.
+Terminal 3 (Red Team attacker app):
+```bash
+source .venv/bin/activate
+python red_team_app.py
+```
+
+Open these side by side:
+
+- Blue Team dashboard: `http://localhost:5173`
+- Red Team launcher: `http://localhost:8002`
+
+## Demo Flow
+
+1. Confirm dashboard is calm in Real Traffic mode.
+2. In Red Team app, click `Launch Brute Force`.
+3. Blue Team logs and risk chart should spike in real time.
+4. Once high risk is detected, source is auto-blocked.
+5. Launch attacks again and observe increased `403` responses.
 
 ## Project Structure
 
 ```
 athernex/
-├── main.py                 # FastAPI backend
+├── main.py                 # Blue Team backend + target + defense middleware
+├── red_team_app.py         # Red Team attack launcher app
 ├── requirements.txt        # Python dependencies
 ├── package.json            # NPM configuration
 ├── vite.config.js          # Vite configuration
@@ -105,20 +158,10 @@ athernex/
 └── .env.example            # Example environment variables
 ```
 
-## Monitoring Dashboard Features
+## Notes
 
-### Panels
-- **Input Panel**: Enter metrics manually or simulate attack
-- **Result Panel**: Real-time threat assessment with animated risk meter
-- **Logs Panel**: Live feed of all events with timestamps
-- **Charts Panel**: Risk score over time and system metrics
-
-### Key Metrics
-- Response Time: Network latency (milliseconds)
-- Status Code: HTTP response status
-- CPU Usage: System processor utilization (%)
-- Memory Usage: RAM consumption (%)
-- Retry Count: Number of request retries
+- The Red Team app is intentionally restricted to localhost targets for safe demo usage.
+- If dependencies are missing in your venv, run `pip install -r requirements.txt`.
 
 ## License
 

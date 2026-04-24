@@ -17,7 +17,9 @@ import logging
 import os
 import pickle
 import sys
+import time
 import zipfile
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,8 +28,9 @@ from typing import Any, Optional
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 # ============================================================================
@@ -88,6 +91,72 @@ class ModelArtifacts:
 
 
 artifacts = ModelArtifacts()
+
+
+# ============================================================================
+# RUNTIME SECURITY STATE
+# ============================================================================
+BLOCKED_SOURCES: set[str] = set()
+SECURITY_EVENTS: deque[dict[str, Any]] = deque(maxlen=1200)
+SOURCE_STATS: dict[str, dict[str, Any]] = defaultdict(
+    lambda: {
+        "window_start": time.time(),
+        "requests_in_window": 0,
+        "total_requests": 0,
+        "failures": 0,
+        "last_seen": time.time(),
+        "last_risk": 0.0,
+    }
+)
+
+
+def append_security_event(event_type: str, source: str, severity: str, message: str, **extra):
+    SECURITY_EVENTS.append(
+        {
+            "timestamp": time.strftime("%H:%M:%S"),
+            "epoch": time.time(),
+            "event_type": event_type,
+            "source": source,
+            "severity": severity,
+            "message": message,
+            **extra,
+        }
+    )
+
+
+def identify_source(request: Request) -> str:
+    attacker_id = request.headers.get("x-attacker-id")
+    if attacker_id:
+        return attacker_id.strip()[:64]
+
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def is_suspicious_payload(request: Request) -> bool:
+    sample = f"{request.url.path} {request.url.query}".lower()
+    markers = ["union", "select", "drop", "--", "or 1=1", "sleep(", "benchmark(", "../"]
+    return any(marker in sample for marker in markers)
+
+
+def update_source_stats(source: str, response_status: int) -> dict[str, Any]:
+    now = time.time()
+    stats = SOURCE_STATS[source]
+    if now - stats["window_start"] >= 60:
+        stats["window_start"] = now
+        stats["requests_in_window"] = 0
+
+    stats["requests_in_window"] += 1
+    stats["total_requests"] += 1
+    stats["last_seen"] = now
+    if response_status >= 400:
+        stats["failures"] += 1
+    return stats
 
 
 # ============================================================================
@@ -229,6 +298,83 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+PROTECTED_PREFIX = "/target"
+
+
+@app.middleware("http")
+async def threat_monitoring_middleware(request: Request, call_next):
+    if not request.url.path.startswith(PROTECTED_PREFIX):
+        return await call_next(request)
+
+    source = identify_source(request)
+    if source in BLOCKED_SOURCES:
+        append_security_event(
+            "blocked_request",
+            source,
+            "critical",
+            f"Blocked source attempted {request.method} {request.url.path}",
+            path=request.url.path,
+        )
+        return JSONResponse(status_code=403, content={"detail": "Source blocked by AegisAI"})
+
+    started = time.perf_counter()
+    response = await call_next(request)
+    response_time_ms = max(1.0, (time.perf_counter() - started) * 1000.0)
+
+    stats = update_source_stats(source, response.status_code)
+    suspicious = is_suspicious_payload(request)
+
+    cpu_estimate = min(100.0, 18.0 + stats["requests_in_window"] * 1.7 + (22 if suspicious else 0))
+    memory_estimate = min(100.0, 30.0 + stats["requests_in_window"] * 1.1)
+    retry_count = min(stats["failures"], 30)
+    message = f"{request.method} {request.url.path} | rps_window={stats['requests_in_window']} | suspicious={suspicious}"
+
+    assessment = evaluate_request_features(
+        {
+            "response_time_ms": response_time_ms,
+            "cpu_usage": cpu_estimate,
+            "memory_usage": memory_estimate,
+            "retry_count": retry_count,
+            "status_code": response.status_code,
+            "message": message,
+        }
+    )
+    stats["last_risk"] = assessment.risk_score
+
+    severity_label = "normal"
+    if assessment.status == "HIGH RISK":
+        severity_label = "critical"
+    elif assessment.status == "MEDIUM RISK":
+        severity_label = "warning"
+
+    append_security_event(
+        "traffic",
+        source,
+        severity_label,
+        f"{request.method} {request.url.path} -> {response.status_code} | risk={assessment.risk_score}",
+        status=assessment.status,
+        action=assessment.action,
+        risk_score=assessment.risk_score,
+        path=request.url.path,
+        response_time_ms=round(response_time_ms, 2),
+    )
+
+    if assessment.status == "HIGH RISK":
+        BLOCKED_SOURCES.add(source)
+        append_security_event(
+            "auto_block",
+            source,
+            "critical",
+            f"AegisAI blocked source after high-risk pattern on {request.url.path}",
+            status=assessment.status,
+            risk_score=assessment.risk_score,
+        )
+
+    response.headers["x-aegis-status"] = assessment.status
+    response.headers["x-aegis-risk"] = str(assessment.risk_score)
+    response.headers["x-aegis-action"] = assessment.action
+    return response
+
 
 # ============================================================================
 # SCHEMAS
@@ -255,6 +401,11 @@ class RiskAssessment(BaseModel):
     status: str
     action: str
     confidence: float
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
 
 
 # ============================================================================
@@ -319,9 +470,126 @@ def classify(prediction: int, risk_score: float) -> tuple[str, str]:
     return "SAFE", "MONITOR"
 
 
+def evaluate_request_features(features: dict[str, Any]) -> RiskAssessment:
+    if artifacts.mode == "missing-model":
+        return RiskAssessment(
+            is_anomaly=False,
+            risk_score=0.0,
+            status="SAFE",
+            action="MONITOR",
+            confidence=0.0,
+        )
+
+    numeric_columns = artifacts.numeric_columns or DEFAULT_FEATURES
+    prediction_request = PredictionRequest(**features)
+    frame = to_input_frame(prediction_request, numeric_columns)
+
+    if artifacts.mode == "bundle-scaler-mvp":
+        prediction, risk_score, confidence = score_from_scaler(frame)
+    else:
+        prediction, risk_score, confidence = score_from_legacy(frame)
+
+    status_text, action = classify(prediction, risk_score)
+    return RiskAssessment(
+        is_anomaly=prediction == -1,
+        risk_score=round(risk_score, 2),
+        status=status_text,
+        action=action,
+        confidence=round(confidence, 2),
+    )
+
+
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
+@app.post("/target/login", tags=["Target App"])
+async def target_login(payload: LoginRequest):
+    if payload.username == "admin" and payload.password == "aegis-safe-pass":
+        return {"ok": True, "token": "demo-token"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@app.get("/target/ping", tags=["Target App"])
+async def target_ping():
+    return {"ok": True, "message": "service responsive"}
+
+
+@app.get("/target/search", tags=["Target App"])
+async def target_search(q: str = ""):
+    if len(q) > 300:
+        raise HTTPException(status_code=400, detail="query too long")
+    return {"query": q, "results": ["asset-1", "asset-2"]}
+
+
+@app.get("/target/ports/{port}", tags=["Target App"])
+async def target_port_probe(port: int):
+    open_ports = {80, 443, 8080}
+    if port in open_ports:
+        return {"port": port, "state": "open"}
+    raise HTTPException(status_code=404, detail="closed")
+
+
+@app.get("/security/events", tags=["Security"])
+async def security_events(limit: int = 120):
+    clipped = max(1, min(limit, 600))
+    events = list(SECURITY_EVENTS)[-clipped:]
+    return {"count": len(events), "events": events}
+
+
+@app.get("/security/blocklist", tags=["Security"])
+async def security_blocklist():
+    return {"blocked_sources": sorted(BLOCKED_SOURCES), "count": len(BLOCKED_SOURCES)}
+
+
+@app.post("/security/unblock/{source}", tags=["Security"])
+async def security_unblock_source(source: str):
+    removed = source in BLOCKED_SOURCES
+    BLOCKED_SOURCES.discard(source)
+    if removed:
+        append_security_event("manual_unblock", source, "warning", "Source unblocked by operator")
+    return {"source": source, "unblocked": removed}
+
+
+@app.post("/security/reset", tags=["Security"])
+async def security_reset():
+    BLOCKED_SOURCES.clear()
+    SOURCE_STATS.clear()
+    SECURITY_EVENTS.clear()
+    append_security_event("reset", "operator", "warning", "Security state reset for new demo run")
+    return {"ok": True, "message": "security state reset"}
+
+
+@app.get("/security/overview", tags=["Security"])
+async def security_overview():
+    now = time.time()
+    active_sources = []
+    high_risk_recent = 0
+
+    for source, stats in SOURCE_STATS.items():
+        if now - stats["last_seen"] <= 600:
+            active_sources.append(
+                {
+                    "source": source,
+                    "requests_in_window": stats["requests_in_window"],
+                    "total_requests": stats["total_requests"],
+                    "failures": stats["failures"],
+                    "last_risk": stats["last_risk"],
+                }
+            )
+        if stats["last_risk"] >= 70:
+            high_risk_recent += 1
+
+    active_sources.sort(key=lambda row: row["requests_in_window"], reverse=True)
+
+    return {
+        "blocked_count": len(BLOCKED_SOURCES),
+        "blocked_sources": sorted(BLOCKED_SOURCES),
+        "event_count": len(SECURITY_EVENTS),
+        "active_sources": active_sources[:10],
+        "high_risk_sources": high_risk_recent,
+    }
+
+
 @app.get("/health", tags=["Health Check"])
 async def health_check():
     return {

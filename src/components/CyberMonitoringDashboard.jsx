@@ -180,6 +180,22 @@ function getNodePosition(id) {
   return NETWORK_NODES.find((node) => node.id === id) || NETWORK_NODES[0];
 }
 
+function routeForPath(path = "") {
+  if (path.includes("/target/login")) return getRouteForScenario("bruteForce");
+  if (path.includes("/target/search")) return getRouteForScenario("sqlInjection");
+  if (path.includes("/target/ports")) return getRouteForScenario("insiderThreat");
+  if (path.includes("/target/ping")) return getRouteForScenario("ddos");
+  return getRouteForScenario("normal");
+}
+
+function scenarioFromPath(path = "") {
+  if (path.includes("/target/login")) return "bruteForce";
+  if (path.includes("/target/search")) return "sqlInjection";
+  if (path.includes("/target/ports")) return "insiderThreat";
+  if (path.includes("/target/ping")) return "ddos";
+  return "normal";
+}
+
 function ScenarioPills({ scenario, setScenario, running }) {
   return (
     <div style={scenarioStripStyle}>
@@ -579,8 +595,10 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
   const pulseRef = useRef(null);
   const attackTimerRef = useRef(null);
   const liveFeedTimerRef = useRef(null);
+  const lastEventEpochRef = useRef(0);
 
   const [scenario, setScenario] = useState("normal");
+  const [liveMode, setLiveMode] = useState(true);
   const [metrics, setMetrics] = useState(createInitialMetrics());
   const [trend, setTrend] = useState(createInitialMetrics());
   const [prediction, setPrediction] = useState(null);
@@ -661,7 +679,7 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
   }, [logs]);
 
   useEffect(() => {
-    if (simulating) return;
+    if (simulating || liveMode) return;
 
     const pool = [
       { message: "Normal API request", severity: "normal" },
@@ -691,9 +709,10 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
     }, 2500);
 
     return () => clearInterval(liveFeedTimerRef.current);
-  }, [simulating]);
+  }, [simulating, liveMode]);
 
   useEffect(() => {
+    if (liveMode) return;
     const current = SCENARIOS[scenario];
     setBreached(false);
     setNetworkFocus("internet");
@@ -707,7 +726,101 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
       retry_count: current.payload.retry_count,
       status_code: current.payload.status_code,
     }));
-  }, [scenario]);
+  }, [scenario, liveMode]);
+
+  useEffect(() => {
+    if (!liveMode) return;
+
+    const sync = async () => {
+      try {
+        const [eventsRes, overviewRes] = await Promise.all([
+          fetch(`${apiBaseUrl}/security/events?limit=180`),
+          fetch(`${apiBaseUrl}/security/overview`),
+        ]);
+
+        if (!eventsRes.ok || !overviewRes.ok) {
+          throw new Error("Unable to fetch security telemetry");
+        }
+
+        const eventsBody = await eventsRes.json();
+        const overview = await overviewRes.json();
+        const events = Array.isArray(eventsBody.events) ? eventsBody.events : [];
+
+        const unseen = events.filter((event) => Number(event.epoch || 0) > lastEventEpochRef.current);
+        if (unseen.length) {
+          lastEventEpochRef.current = Number(unseen[unseen.length - 1].epoch || lastEventEpochRef.current);
+
+          setLogs((prev) => {
+            const mapped = unseen.map((event) => ({
+              id: `${event.epoch}-${event.source}-${event.event_type}`,
+              timestamp: event.timestamp || nowLabel(),
+              message: `${event.source}: ${event.message}`,
+              severity: event.severity || "normal",
+            }));
+            return [...prev, ...mapped].slice(-220);
+          });
+
+          setTimeline((prev) => {
+            const mapped = unseen.slice(-10).map((event) => ({
+              id: `${event.epoch}-${event.event_type}`,
+              timestamp: event.timestamp || nowLabel(),
+              tag: (event.event_type || "event").toUpperCase(),
+              message: event.message,
+              severity: event.severity || "normal",
+            }));
+            return [...prev, ...mapped].slice(-18);
+          });
+        }
+
+        const trafficEvents = events.filter((event) => event.event_type === "traffic");
+        const latest = trafficEvents[trafficEvents.length - 1];
+        if (latest) {
+          const latestRisk = Number(latest.risk_score || 0);
+          const toneScenario = scenarioFromPath(latest.path || "");
+          setScenario(toneScenario);
+          setPrediction({
+            status: latest.status || "SAFE",
+            action: latest.action || "MONITOR",
+            confidence: 1,
+            risk_score: latestRisk,
+          });
+          setRiskHistory((prev) => [...prev.slice(-49), { time: latest.timestamp || nowLabel(), risk: latestRisk }]);
+          setBreached((latest.status || "").includes("HIGH"));
+
+          const route = routeForPath(latest.path || "");
+          setNetworkFocus(route[route.length - 1]);
+          setAttackPath({
+            route,
+            progress: Math.max(1, route.length - 1),
+            pulseCount: (latest.status || "").includes("HIGH") ? 5 : 3,
+            pulseTick: Date.now() / 120,
+          });
+        }
+
+        const topSource = Array.isArray(overview.active_sources) ? overview.active_sources[0] : null;
+        if (topSource) {
+          const next = {
+            response_time_ms: Math.max(80, 140 + topSource.requests_in_window * 18),
+            cpu_usage: Math.min(100, 16 + topSource.requests_in_window * 3.2),
+            memory_usage: Math.min(100, 28 + topSource.requests_in_window * 2),
+            retry_count: topSource.failures || 0,
+            status_code: 200,
+            activeScenario: "live",
+          };
+          setMetrics((prev) => {
+            setTrend({ ...prev });
+            return next;
+          });
+        }
+      } catch (err) {
+        setError(err.message || "Failed to sync live telemetry");
+      }
+    };
+
+    sync();
+    const interval = setInterval(sync, 1300);
+    return () => clearInterval(interval);
+  }, [apiBaseUrl, liveMode]);
 
   const callPredict = async (payload) => {
     const response = await fetch(`${apiBaseUrl}/predict`, {
@@ -833,17 +946,26 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
           <div style={eyebrowStyle}>AegisAI Monitoring</div>
           <h1 style={{ margin: 0, fontSize: 28 }}>Realtime Threat Operations Console</h1>
           <p style={{ marginTop: 8, marginBottom: 0, color: "#94a3b8", maxWidth: 760 }}>
-            Watch live attack scenarios unfold without manual input. Scenario-driven simulations stream metrics,
-            logs, threat scores, and auto-response actions in real time.
+            Blue Team mode now consumes real traffic telemetry from the protected target app while Red Team launches
+            actual HTTP attack bursts from a separate app.
           </p>
         </div>
         <div style={liveBadgeStyle}>
           <span ref={pulseRef} style={pulseDotStyle} />
-          LIVE THREAT FEED
+          {liveMode ? "LIVE DEFENSE MODE" : "SIMULATION MODE"}
         </div>
       </div>
 
-      <ScenarioPills scenario={scenario} setScenario={simulateScenario} running={simulating || loading} />
+      <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+        <button type="button" style={toggleStyle} onClick={() => setLiveMode(true)}>
+          Use Real Traffic Mode
+        </button>
+        <button type="button" style={toggleStyle} onClick={() => setLiveMode(false)}>
+          Use Simulator Mode
+        </button>
+      </div>
+
+      {!liveMode ? <ScenarioPills scenario={scenario} setScenario={simulateScenario} running={simulating || loading} /> : null}
 
       <div style={topGridStyle}>
         <AttackSurfacePanel metrics={metrics} trend={trend} />
