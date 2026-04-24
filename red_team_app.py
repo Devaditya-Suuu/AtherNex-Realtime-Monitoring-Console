@@ -97,6 +97,11 @@ async def attacker_ui():
     .buttons { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; }
     button { background:linear-gradient(135deg,#7f1d1d,#dc2626); color:#fff; border:none; border-radius:10px; padding:12px; font-weight:700; cursor:pointer; }
     button.safe { background:linear-gradient(135deg,#065f46,#0d9488); }
+    .toggle { margin-top:12px; display:flex; align-items:center; gap:8px; color:#cbd5e1; font-size:13px; }
+    .range-wrap { margin-top:10px; display:grid; gap:6px; color:#cbd5e1; }
+    .range-row { display:flex; align-items:center; gap:10px; }
+    .range-row input[type=range] { flex:1; }
+    .range-value { min-width:92px; text-align:right; font-weight:700; color:#f8fafc; }
     input { width:100%; background:#020617; border:1px solid #334155; color:#e2e8f0; border-radius:10px; padding:10px; }
     pre { background:#020617; border:1px solid #334155; border-radius:10px; padding:12px; min-height:120px; overflow:auto; }
   </style>
@@ -108,6 +113,17 @@ async def attacker_ui():
       <p>Fire real HTTP attack traffic against your Blue Team target.</p>
       <label>Target Base URL</label>
       <input id=\"target\" value=\"http://127.0.0.1:8001\" />
+      <label class=\"toggle\">
+        <input id=\"clientBurst\" type=\"checkbox\" style=\"width:auto;\" />
+        Browser Burst Mode (show every request in DevTools network tab)
+      </label>
+      <div class=\"range-wrap\">
+        <label>Burst Intensity</label>
+        <div class=\"range-row\">
+          <input id=\"burstIntensity\" type=\"range\" min=\"1\" max=\"5\" step=\"1\" value=\"3\" />
+          <span id=\"burstLabel\" class=\"range-value\">Level 3</span>
+        </div>
+      </div>
             <div class=\"buttons\" style=\"margin-top:12px;\">
                 <button class=\"safe\" onclick=\"runAttack('normal')\">Send Normal Traffic</button>
                 <button onclick=\"runAttack('brute-force')\">Launch Brute Force</button>
@@ -121,6 +137,15 @@ async def attacker_ui():
     </div>
 
     <div class=\"card\">
+      <h2 style=\"margin-top:0;\">Insider Threat Scenarios</h2>
+      <div class=\"buttons\">
+        <button onclick=\"runAttack('insider-after-hours')\">👤 After Hours Intrusion</button>
+        <button onclick=\"runAttack('insider-privilege-escalation')\">📈 Privilege Escalation</button>
+        <button onclick=\"runAttack('insider-mass-exfiltration')\">💾 Mass Data Exfiltration</button>
+      </div>
+    </div>
+
+    <div class=\"card\">
       <h3>Result</h3>
       <pre id=\"out\">Ready.</pre>
     </div>
@@ -128,9 +153,188 @@ async def attacker_ui():
 
   <script>
     const out = document.getElementById('out');
+    const intensityInput = document.getElementById('burstIntensity');
+    const intensityLabel = document.getElementById('burstLabel');
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const burstHeaders = {
+      'x-attacker-id': 'red-team-browser',
+      'Content-Type': 'application/json'
+    };
+    const intensityMap = {
+      1: { ddos: 160, brute: 90, sqli: 70, ports: 35, wave: 24, insiderDownload: 80, normalPing: 8, normalSearch: 5 },
+      2: { ddos: 350, brute: 180, sqli: 120, ports: 60, wave: 40, insiderDownload: 200, normalPing: 12, normalSearch: 8 },
+      3: { ddos: 700, brute: 320, sqli: 220, ports: 95, wave: 70, insiderDownload: 400, normalPing: 16, normalSearch: 10 },
+      4: { ddos: 1100, brute: 520, sqli: 340, ports: 120, wave: 100, insiderDownload: 700, normalPing: 20, normalSearch: 14 },
+      5: { ddos: 1600, brute: 760, sqli: 520, ports: 150, wave: 140, insiderDownload: 1000, normalPing: 26, normalSearch: 18 }
+    };
+
+    function selectedIntensity() {
+      const level = Number(intensityInput?.value || 3);
+      return intensityMap[level] || intensityMap[3];
+    }
+
+    function updateIntensityLabel() {
+      const level = Number(intensityInput?.value || 3);
+      const profile = intensityMap[level] || intensityMap[3];
+      intensityLabel.textContent = `Level ${level} (${profile.ddos} DDoS req)`;
+    }
+
+    if (intensityInput) {
+      intensityInput.addEventListener('input', updateIntensityLabel);
+      updateIntensityLabel();
+    }
+
+    async function sendInWaves(requests, waveSize = 60) {
+      const counts = {};
+      let failed = 0;
+
+      for (let i = 0; i < requests.length; i += waveSize) {
+        const wave = requests.slice(i, i + waveSize);
+        const results = await Promise.allSettled(
+          wave.map((req) => fetch(req.url, req.options))
+        );
+        for (const result of results) {
+          if (result.status === 'fulfilled') {
+            const code = result.value.status;
+            counts[code] = (counts[code] || 0) + 1;
+          } else {
+            failed += 1;
+          }
+        }
+      }
+
+      if (failed > 0) counts[0] = failed;
+      return counts;
+    }
+
+    async function runBrowserAttack(kind, target) {
+      const started = performance.now();
+      const requests = [];
+      const profile = selectedIntensity();
+
+      if (kind === 'ddos') {
+        for (let i = 0; i < profile.ddos; i++) {
+          requests.push({ url: `${target}/target/ping`, options: { method: 'GET', headers: burstHeaders } });
+        }
+      } else if (kind === 'brute-force') {
+        for (let i = 0; i < profile.brute; i++) {
+          requests.push({
+            url: `${target}/target/login`,
+            options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'admin', password: `wrong-${i}` }) }
+          });
+        }
+      } else if (kind === 'sql-injection') {
+        const payloads = [
+          "admin' OR 1=1 --",
+          "' UNION SELECT password FROM users --",
+          "' OR SLEEP(2) --",
+          "' ; DROP TABLE users; --"
+        ];
+        for (let i = 0; i < profile.sqli; i++) {
+          const q = encodeURIComponent(payloads[i % payloads.length] + String(100 + i));
+          requests.push({ url: `${target}/target/search?q=${q}`, options: { method: 'GET', headers: burstHeaders } });
+        }
+      } else if (kind === 'port-scan') {
+        const ports = Array.from({ length: profile.ports }, (_, i) => i + 75).concat([443, 8080, 3306, 5432, 6379]);
+        for (const port of ports) {
+          requests.push({ url: `${target}/target/ports/${port}`, options: { method: 'GET', headers: burstHeaders } });
+        }
+      } else if (kind === 'normal') {
+        for (let i = 0; i < profile.normalPing; i++) requests.push({ url: `${target}/target/ping`, options: { method: 'GET', headers: { 'x-attacker-id': 'normal-browser-client' } } });
+        for (let i = 0; i < profile.normalSearch; i++) requests.push({ url: `${target}/target/search?q=dashboard+view+${i}`, options: { method: 'GET', headers: { 'x-attacker-id': 'normal-browser-client' } } });
+        for (let i = 0; i < 4; i++) {
+          requests.push({
+            url: `${target}/target/login`,
+            options: { method: 'POST', headers: { 'x-attacker-id': 'normal-browser-client', 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'admin', password: 'aegis-safe-pass' }) }
+          });
+        }
+      } else if (kind === 'insider-after-hours') {
+        const sequence = [
+          { url: `${target}/internal/login`, options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'alice', location: 'Moscow', hour: 2 }) } },
+          { url: `${target}/internal/access`, options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'alice', department: 'finance' }) } },
+          { url: `${target}/internal/download`, options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'alice', department: 'finance', file_count: 500 }) } }
+        ];
+        const counts = {};
+        for (const req of sequence) {
+          try {
+            const response = await fetch(req.url, req.options);
+            counts[response.status] = (counts[response.status] || 0) + 1;
+          } catch (_e) {
+            counts[0] = (counts[0] || 0) + 1;
+          }
+          await sleep(500);
+        }
+        return {
+          attack: kind,
+          mode: 'browser-burst',
+          attempted: sequence.length,
+          duration_sec: Number(((performance.now() - started) / 1000).toFixed(2)),
+          status_counts: counts,
+          timestamp: new Date().toLocaleTimeString()
+        };
+      } else if (kind === 'insider-privilege-escalation') {
+        const departments = ['hr', 'finance', 'executive', 'legal'];
+        for (const dept of departments) {
+          requests.push({
+            url: `${target}/internal/access`,
+            options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'bob', department: dept }) }
+          });
+        }
+        requests.push({
+          url: `${target}/internal/download`,
+          options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'bob', department: 'executive', file_count: 200 }) }
+        });
+      } else if (kind === 'insider-mass-exfiltration') {
+        const sequence = [
+          { url: `${target}/internal/login`, options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'carol', location: 'Delhi', hour: 3 }) } },
+          { url: `${target}/internal/download`, options: { method: 'POST', headers: burstHeaders, body: JSON.stringify({ username: 'carol', department: 'finance', file_count: profile.insiderDownload }) } }
+        ];
+        const counts = {};
+        for (const req of sequence) {
+          try {
+            const response = await fetch(req.url, req.options);
+            counts[response.status] = (counts[response.status] || 0) + 1;
+          } catch (_e) {
+            counts[0] = (counts[0] || 0) + 1;
+          }
+        }
+        return {
+          attack: kind,
+          mode: 'browser-burst',
+          attempted: sequence.length,
+          duration_sec: Number(((performance.now() - started) / 1000).toFixed(2)),
+          status_counts: counts,
+          timestamp: new Date().toLocaleTimeString()
+        };
+      }
+
+      const counts = await sendInWaves(requests, kind === 'ddos' ? profile.wave : Math.max(24, Math.floor(profile.wave * 0.6)));
+      return {
+        attack: kind,
+        mode: 'browser-burst',
+        intensity_level: Number(intensityInput?.value || 3),
+        attempted: requests.length,
+        duration_sec: Number(((performance.now() - started) / 1000).toFixed(2)),
+        status_counts: counts,
+        timestamp: new Date().toLocaleTimeString()
+      };
+    }
+
     async function runAttack(kind) {
       out.textContent = 'Launching ' + kind + '...';
       const target = document.getElementById('target').value.trim();
+      const browserBurst = document.getElementById('clientBurst').checked;
+
+      if (browserBurst) {
+        try {
+          const data = await runBrowserAttack(kind, target);
+          out.textContent = JSON.stringify(data, null, 2);
+        } catch (err) {
+          out.textContent = JSON.stringify({ error: err.message || 'Browser burst failed' }, null, 2);
+        }
+        return;
+      }
+
       const res = await fetch('/attack/' + kind, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -166,6 +370,101 @@ async def check_blocklist(target_base_url: str = TARGET_BASE_URL):
             headers={"x-attacker-id": ATTACKER_ID},
         )
     return resp.json()
+
+
+@app.post("/attack/insider-after-hours")
+async def attack_insider_after_hours(req: AttackRequest):
+    assert_safe_target(req.target_base_url)
+    started = time.time()
+    counts: dict[int, int] = {}
+
+    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+        try:
+            login = await client.post(
+                f"{req.target_base_url}/internal/login",
+                json={"username": "alice", "location": "Moscow", "hour": 2},
+            )
+            counts[login.status_code] = counts.get(login.status_code, 0) + 1
+        except Exception:
+            counts[0] = counts.get(0, 0) + 1
+        await asyncio.sleep(0.5)
+
+        try:
+            access = await client.post(
+                f"{req.target_base_url}/internal/access",
+                json={"username": "alice", "department": "finance"},
+            )
+            counts[access.status_code] = counts.get(access.status_code, 0) + 1
+        except Exception:
+            counts[0] = counts.get(0, 0) + 1
+        await asyncio.sleep(0.5)
+
+        try:
+            download = await client.post(
+                f"{req.target_base_url}/internal/download",
+                json={"username": "alice", "department": "finance", "file_count": 500},
+            )
+            counts[download.status_code] = counts.get(download.status_code, 0) + 1
+        except Exception:
+            counts[0] = counts.get(0, 0) + 1
+
+    return summarize("insider-after-hours", started, counts, 3)
+
+
+@app.post("/attack/insider-privilege-escalation")
+async def attack_insider_privilege_escalation(req: AttackRequest):
+    assert_safe_target(req.target_base_url)
+    started = time.time()
+    departments = ["hr", "finance", "executive", "legal"]
+    requests_to_send = [
+        (
+            "POST",
+            f"{req.target_base_url}/internal/access",
+            {"username": "bob", "department": dept},
+        )
+        for dept in departments
+    ]
+
+    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+        counts = await run_batch(client, requests_to_send)
+        try:
+            download = await client.post(
+                f"{req.target_base_url}/internal/download",
+                json={"username": "bob", "department": "executive", "file_count": 200},
+            )
+            counts[download.status_code] = counts.get(download.status_code, 0) + 1
+        except Exception:
+            counts[0] = counts.get(0, 0) + 1
+
+    return summarize("insider-privilege-escalation", started, counts, 5)
+
+
+@app.post("/attack/insider-mass-exfiltration")
+async def attack_insider_mass_exfiltration(req: AttackRequest):
+    assert_safe_target(req.target_base_url)
+    started = time.time()
+    counts: dict[int, int] = {}
+
+    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+        try:
+            login = await client.post(
+                f"{req.target_base_url}/internal/login",
+                json={"username": "carol", "location": "Delhi", "hour": 3},
+            )
+            counts[login.status_code] = counts.get(login.status_code, 0) + 1
+        except Exception:
+            counts[0] = counts.get(0, 0) + 1
+
+        try:
+            download = await client.post(
+                f"{req.target_base_url}/internal/download",
+                json={"username": "carol", "department": "finance", "file_count": 1000},
+            )
+            counts[download.status_code] = counts.get(download.status_code, 0) + 1
+        except Exception:
+            counts[0] = counts.get(0, 0) + 1
+
+    return summarize("insider-mass-exfiltration", started, counts, 2)
 
 
 @app.post("/attack/brute-force")

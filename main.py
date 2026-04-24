@@ -28,6 +28,7 @@ from typing import Any, Optional
 import joblib
 import numpy as np
 import pandas as pd
+import socketio
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -109,6 +110,41 @@ SOURCE_STATS: dict[str, dict[str, Any]] = defaultdict(
     }
 )
 
+USER_BASELINES: dict[str, dict[str, Any]] = {
+    "alice": {
+        "departments": {"engineering"},
+        "location": "bangalore",
+        "work_start": 9,
+        "work_end": 18,
+        "daily_downloads": 3,
+    },
+    "bob": {
+        "departments": {"marketing"},
+        "location": "mumbai",
+        "work_start": 10,
+        "work_end": 19,
+        "daily_downloads": 5,
+    },
+    "carol": {
+        "departments": {"finance"},
+        "location": "delhi",
+        "work_start": 8,
+        "work_end": 17,
+        "daily_downloads": 8,
+    },
+    "admin": {
+        "departments": {"*"},
+        "location": "bangalore",
+        "work_start": 9,
+        "work_end": 18,
+        "daily_downloads": 10,
+    },
+}
+SUSPENDED_ACCOUNTS: set[str] = set()
+USER_ACCESS_HISTORY: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=40))
+
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+
 
 def append_security_event(event_type: str, source: str, severity: str, message: str, **extra):
     SECURITY_EVENTS.append(
@@ -157,6 +193,107 @@ def update_source_stats(source: str, response_status: int) -> dict[str, Any]:
     if response_status >= 400:
         stats["failures"] += 1
     return stats
+
+
+def normalize_user(username: str) -> str:
+    return username.strip().lower()
+
+
+def normalize_department(department: str) -> str:
+    return department.strip().lower()
+
+
+def is_suspended_account(username: str) -> bool:
+    return normalize_user(username) in SUSPENDED_ACCOUNTS
+
+
+def requires_department_check(baseline_departments: set[str], department: str) -> bool:
+    if "*" in baseline_departments:
+        return False
+    return normalize_department(department) not in baseline_departments
+
+
+def build_insider_response(score: int) -> tuple[str, str]:
+    if score >= 70:
+        return "HIGH RISK", "SUSPEND ACCOUNT"
+    if score >= 40:
+        return "MEDIUM RISK", "ALERT SECURITY TEAM"
+    return "LOW RISK", "MONITOR"
+
+
+async def emit_insider_threat(payload: dict[str, Any]) -> None:
+    await sio.emit("insider_threat", payload)
+
+
+def score_insider_threat(username: str, activity: dict[str, Any]) -> dict[str, Any]:
+    user = normalize_user(username)
+    baseline = USER_BASELINES.get(user)
+    if baseline is None:
+        return {
+            "username": user,
+            "risk_score": 100,
+            "level": "HIGH RISK",
+            "action": "SUSPEND ACCOUNT",
+            "anomalies": [f"Unknown user '{username}' attempted privileged internal operation"],
+            "timestamp": time.strftime("%H:%M:%S"),
+        }
+
+    score = 0
+    anomalies: list[str] = []
+
+    login_hour = activity.get("hour")
+    if login_hour is not None:
+        if login_hour < baseline["work_start"] or login_hour >= baseline["work_end"]:
+            score += 30
+            anomalies.append(
+                f"Login at {int(login_hour)}:00 - outside normal hours ({baseline['work_start']}:00-{baseline['work_end']}:00)"
+            )
+
+    login_location = activity.get("location")
+    if login_location:
+        normalized_location = login_location.strip().lower()
+        if normalized_location != baseline["location"]:
+            score += 35
+            anomalies.append(
+                f"Login from {login_location} - usual location is {baseline['location'].title()}"
+            )
+
+    department = activity.get("department")
+    if department and requires_department_check(baseline["departments"], department):
+        score += 40
+        anomalies.append(
+            f"Accessed {department} dept - not in authorized clearance"
+        )
+
+    file_count = activity.get("file_count")
+    if file_count is not None:
+        threshold = baseline["daily_downloads"] * 5
+        if int(file_count) > threshold:
+            score += 50
+            anomalies.append(
+                f"Downloaded {int(file_count)} files - daily average is {baseline['daily_downloads']}"
+            )
+
+    if activity.get("record_access"):
+        now = time.time()
+        history = USER_ACCESS_HISTORY[user]
+        history.append({"department": normalize_department(department or "unknown"), "timestamp": now})
+        while history and now - history[0]["timestamp"] > 120:
+            history.popleft()
+        distinct_departments = {entry["department"] for entry in history}
+        if len(distinct_departments) >= 3:
+            score += 25
+            anomalies.append("Multiple department accesses detected within a short time window")
+
+    level, action = build_insider_response(score)
+    return {
+        "username": user,
+        "risk_score": score,
+        "level": level,
+        "action": action,
+        "anomalies": anomalies,
+        "timestamp": time.strftime("%H:%M:%S"),
+    }
 
 
 # ============================================================================
@@ -408,6 +545,23 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=128)
 
 
+class InternalLoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    location: str = Field(..., min_length=1, max_length=64)
+    hour: int = Field(..., ge=0, le=23)
+
+
+class InternalDownloadRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    department: str = Field(..., min_length=1, max_length=64)
+    file_count: int = Field(..., ge=0)
+
+
+class InternalAccessRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    department: str = Field(..., min_length=1, max_length=64)
+
+
 # ============================================================================
 # HELPERS
 # ============================================================================
@@ -529,6 +683,117 @@ async def target_port_probe(port: int):
     raise HTTPException(status_code=404, detail="closed")
 
 
+@app.post("/internal/login", tags=["Insider Threat"])
+async def internal_login(payload: InternalLoginRequest):
+    username = normalize_user(payload.username)
+    if is_suspended_account(username):
+        raise HTTPException(status_code=403, detail=f"Account '{username}' is suspended")
+
+    result = score_insider_threat(
+        username,
+        {
+            "hour": payload.hour,
+            "location": payload.location,
+        },
+    )
+    append_security_event(
+        "insider_login",
+        username,
+        "critical" if result["level"] == "HIGH RISK" else "warning" if result["level"] == "MEDIUM RISK" else "normal",
+        f"Internal login check -> {result['level']} ({result['risk_score']})",
+        risk_score=result["risk_score"],
+        level=result["level"],
+        action=result["action"],
+        anomalies=result["anomalies"],
+    )
+    await emit_insider_threat(result)
+
+    if result["level"] == "HIGH RISK":
+        SUSPENDED_ACCOUNTS.add(username)
+        append_security_event(
+            "insider_suspend",
+            username,
+            "critical",
+            f"Account suspended after insider login anomaly (score={result['risk_score']})",
+        )
+        return JSONResponse(status_code=403, content=result)
+    return result
+
+
+@app.post("/internal/download", tags=["Insider Threat"])
+async def internal_download(payload: InternalDownloadRequest):
+    username = normalize_user(payload.username)
+    if is_suspended_account(username):
+        raise HTTPException(status_code=403, detail=f"Account '{username}' is suspended")
+
+    result = score_insider_threat(
+        username,
+        {
+            "department": payload.department,
+            "file_count": payload.file_count,
+        },
+    )
+    append_security_event(
+        "insider_download",
+        username,
+        "critical" if result["level"] == "HIGH RISK" else "warning" if result["level"] == "MEDIUM RISK" else "normal",
+        f"Internal download check -> {result['level']} ({result['risk_score']})",
+        risk_score=result["risk_score"],
+        level=result["level"],
+        action=result["action"],
+        anomalies=result["anomalies"],
+    )
+    await emit_insider_threat(result)
+
+    if result["level"] == "HIGH RISK":
+        SUSPENDED_ACCOUNTS.add(username)
+        append_security_event(
+            "insider_suspend",
+            username,
+            "critical",
+            f"Account suspended after suspicious download volume (score={result['risk_score']})",
+        )
+        return JSONResponse(status_code=403, content=result)
+    return result
+
+
+@app.post("/internal/access", tags=["Insider Threat"])
+async def internal_access(payload: InternalAccessRequest):
+    username = normalize_user(payload.username)
+    if is_suspended_account(username):
+        raise HTTPException(status_code=403, detail=f"Account '{username}' is suspended")
+
+    result = score_insider_threat(
+        username,
+        {
+            "department": payload.department,
+            "record_access": True,
+        },
+    )
+    append_security_event(
+        "insider_access",
+        username,
+        "critical" if result["level"] == "HIGH RISK" else "warning" if result["level"] == "MEDIUM RISK" else "normal",
+        f"Internal access check -> {result['level']} ({result['risk_score']})",
+        risk_score=result["risk_score"],
+        level=result["level"],
+        action=result["action"],
+        anomalies=result["anomalies"],
+    )
+    await emit_insider_threat(result)
+
+    if result["level"] == "HIGH RISK":
+        SUSPENDED_ACCOUNTS.add(username)
+        append_security_event(
+            "insider_suspend",
+            username,
+            "critical",
+            f"Account suspended after suspicious access behavior (score={result['risk_score']})",
+        )
+        return JSONResponse(status_code=403, content=result)
+    return result
+
+
 @app.get("/security/events", tags=["Security"])
 async def security_events(limit: int = 120):
     clipped = max(1, min(limit, 600))
@@ -555,6 +820,8 @@ async def security_reset():
     BLOCKED_SOURCES.clear()
     SOURCE_STATS.clear()
     SECURITY_EVENTS.clear()
+    SUSPENDED_ACCOUNTS.clear()
+    USER_ACCESS_HISTORY.clear()
     append_security_event("reset", "operator", "warning", "Security state reset for new demo run")
     return {"ok": True, "message": "security state reset"}
 
@@ -584,6 +851,8 @@ async def security_overview():
     return {
         "blocked_count": len(BLOCKED_SOURCES),
         "blocked_sources": sorted(BLOCKED_SOURCES),
+        "suspended_account_count": len(SUSPENDED_ACCOUNTS),
+        "suspended_accounts": sorted(SUSPENDED_ACCOUNTS),
         "event_count": len(SECURITY_EVENTS),
         "active_sources": active_sources[:10],
         "high_risk_sources": high_risk_recent,
@@ -680,4 +949,5 @@ async def simulate_attack():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+    socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
+    uvicorn.run(socket_app, host="0.0.0.0", port=8001, log_level="info")

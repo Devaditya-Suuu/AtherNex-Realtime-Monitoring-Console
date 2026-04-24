@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { gsap } from "gsap";
+import { io } from "socket.io-client";
 import {
   CartesianGrid,
   Line,
@@ -181,6 +182,7 @@ function getNodePosition(id) {
 }
 
 function routeForPath(path = "") {
+  if (path.includes("/internal/")) return getRouteForScenario("insiderThreat");
   if (path.includes("/target/login")) return getRouteForScenario("bruteForce");
   if (path.includes("/target/search")) return getRouteForScenario("sqlInjection");
   if (path.includes("/target/ports")) return getRouteForScenario("insiderThreat");
@@ -189,11 +191,58 @@ function routeForPath(path = "") {
 }
 
 function scenarioFromPath(path = "") {
+  if (path.includes("/internal/")) return "insiderThreat";
   if (path.includes("/target/login")) return "bruteForce";
   if (path.includes("/target/search")) return "sqlInjection";
   if (path.includes("/target/ports")) return "insiderThreat";
   if (path.includes("/target/ping")) return "ddos";
   return "normal";
+}
+
+function assessmentFromSecurityEvent(event) {
+  if (!event) return null;
+
+  if (event.event_type === "traffic") {
+    return {
+      status: event.status || "SAFE",
+      action: event.action || "MONITOR",
+      risk_score: Number(event.risk_score || 0),
+      confidence: 1,
+      scenario: scenarioFromPath(event.path || ""),
+      route: routeForPath(event.path || ""),
+    };
+  }
+
+  if (event.event_type === "auto_block" || event.event_type === "blocked_request") {
+    return {
+      status: "HIGH RISK",
+      action: "BLOCK IP",
+      risk_score: Number(event.risk_score || 100),
+      confidence: 1,
+      scenario: scenarioFromPath(event.path || "/target/login"),
+      route: routeForPath(event.path || "/target/login"),
+    };
+  }
+
+  if (
+    event.event_type === "insider_login" ||
+    event.event_type === "insider_access" ||
+    event.event_type === "insider_download" ||
+    event.event_type === "insider_suspend"
+  ) {
+    const level = event.level || "LOW RISK";
+    const status = level === "HIGH RISK" ? "HIGH RISK" : level === "MEDIUM RISK" ? "MEDIUM RISK" : "SAFE";
+    return {
+      status,
+      action: event.action || (level === "HIGH RISK" ? "SUSPEND ACCOUNT" : "MONITOR"),
+      risk_score: Number(event.risk_score || (level === "HIGH RISK" ? 90 : level === "MEDIUM RISK" ? 55 : 20)),
+      confidence: 1,
+      scenario: "insiderThreat",
+      route: getRouteForScenario("insiderThreat"),
+    };
+  }
+
+  return null;
 }
 
 function ScenarioPills({ scenario, setScenario, running }) {
@@ -589,6 +638,44 @@ function ThreatTimeline({ events }) {
   );
 }
 
+function InsiderThreatMonitor({ alerts }) {
+  return (
+    <section className="anim-panel panel-card" style={{ ...panelStyle, marginTop: 14 }}>
+      <div className="panel-head">
+        <h3 style={panelTitleStyle}>Insider Threat Monitor</h3>
+        <span className="subtle-tag">Socket.IO live feed</span>
+      </div>
+      <div style={timelineWrapStyle}>
+        {alerts.length === 0 ? (
+          <div style={{ color: "#94a3b8", fontSize: 13 }}>No insider threat events received yet.</div>
+        ) : (
+          alerts.map((alert) => (
+            <div key={alert.id} style={{ ...endCardStyle, marginTop: 0, borderColor: `${alert.color}55` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                <strong style={{ color: alert.color, fontSize: 16 }}>
+                  {alert.username} - {alert.level}
+                </strong>
+                <span style={{ ...subtleTagStyle, borderColor: `${alert.color}55`, color: alert.color }}>
+                  Risk {alert.risk_score}
+                </span>
+              </div>
+              <div style={incidentMetaStyle}>Action: <strong>{alert.action}</strong></div>
+              <div style={incidentMetaStyle}>Time: {alert.timestamp}</div>
+              <div style={{ marginTop: 8, display: "grid", gap: 5 }}>
+                {(alert.anomalies || []).map((entry, idx) => (
+                  <div key={`${alert.id}-${idx}`} style={{ fontSize: 12, color: "#cbd5e1" }}>
+                    - {entry}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhost:8001" }) {
   const rootRef = useRef(null);
   const logsRef = useRef(null);
@@ -596,6 +683,7 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
   const attackTimerRef = useRef(null);
   const liveFeedTimerRef = useRef(null);
   const lastEventEpochRef = useRef(0);
+  const lastIncidentEpochRef = useRef(0);
 
   const [scenario, setScenario] = useState("normal");
   const [liveMode, setLiveMode] = useState(true);
@@ -614,6 +702,7 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
   const [networkFocus, setNetworkFocus] = useState("internet");
   const [breached, setBreached] = useState(false);
   const [attackPath, setAttackPath] = useState(null);
+  const [insiderAlerts, setInsiderAlerts] = useState([]);
 
   const addLog = (message, severity = "normal") => {
     setLogs((prev) => {
@@ -772,27 +861,55 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
           });
         }
 
-        const trafficEvents = events.filter((event) => event.event_type === "traffic");
-        const latest = trafficEvents[trafficEvents.length - 1];
-        if (latest) {
-          const latestRisk = Number(latest.risk_score || 0);
-          const toneScenario = scenarioFromPath(latest.path || "");
-          setScenario(toneScenario);
+        const assessmentEvents = events.filter(
+          (event) =>
+            event.event_type === "traffic" ||
+            event.event_type === "auto_block" ||
+            event.event_type === "insider_login" ||
+            event.event_type === "insider_access" ||
+            event.event_type === "insider_download" ||
+            event.event_type === "insider_suspend"
+        );
+
+        // Use newest event overall (epoch) so Incident Response reflects
+        // current real-traffic state instead of sticking to older block events.
+        // If epochs are equal, prioritize stronger event types.
+        const eventPriority = (eventType) => {
+          if (eventType === "insider_suspend" || eventType === "auto_block") return 4;
+          if (eventType === "insider_download" || eventType === "insider_access" || eventType === "insider_login") return 3;
+          if (eventType === "traffic") return 2;
+          return 0;
+        };
+        const latest = [...assessmentEvents]
+          .sort((a, b) => {
+            const epochDiff = Number(a.epoch || 0) - Number(b.epoch || 0);
+            if (epochDiff !== 0) return epochDiff;
+            return eventPriority(a.event_type) - eventPriority(b.event_type);
+          })
+          .pop() || null;
+        const latestEpoch = Number(latest?.epoch || 0);
+        const latestAssessment = assessmentFromSecurityEvent(latest);
+
+        // Guard against overlapping poll responses applying stale SAFE state.
+        if (latest && latestAssessment && latestEpoch >= lastIncidentEpochRef.current) {
+          lastIncidentEpochRef.current = latestEpoch;
+          const latestRisk = Number(latestAssessment.risk_score || 0);
+          setScenario(latestAssessment.scenario);
           setPrediction({
-            status: latest.status || "SAFE",
-            action: latest.action || "MONITOR",
-            confidence: 1,
+            status: latestAssessment.status,
+            action: latestAssessment.action,
+            confidence: latestAssessment.confidence,
             risk_score: latestRisk,
           });
           setRiskHistory((prev) => [...prev.slice(-49), { time: latest.timestamp || nowLabel(), risk: latestRisk }]);
-          setBreached((latest.status || "").includes("HIGH"));
+          setBreached((latestAssessment.status || "").includes("HIGH"));
 
-          const route = routeForPath(latest.path || "");
+          const route = latestAssessment.route;
           setNetworkFocus(route[route.length - 1]);
           setAttackPath({
             route,
             progress: Math.max(1, route.length - 1),
-            pulseCount: (latest.status || "").includes("HIGH") ? 5 : 3,
+            pulseCount: (latestAssessment.status || "").includes("HIGH") ? 5 : 3,
             pulseTick: Date.now() / 120,
           });
         }
@@ -821,6 +938,39 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
     const interval = setInterval(sync, 1300);
     return () => clearInterval(interval);
   }, [apiBaseUrl, liveMode]);
+
+  useEffect(() => {
+    const socket = io(apiBaseUrl, {
+      transports: ["websocket", "polling"],
+      reconnection: true,
+    });
+
+    socket.on("insider_threat", (payload) => {
+      const level = payload?.level || "LOW RISK";
+      const color = level.includes("HIGH")
+        ? "#ef4444"
+        : level.includes("MEDIUM")
+          ? "#f59e0b"
+          : "#22c55e";
+      setInsiderAlerts((prev) => [
+        {
+          id: `${Date.now()}-${Math.random()}`,
+          username: payload?.username || "unknown",
+          risk_score: Number(payload?.risk_score || 0),
+          level,
+          action: payload?.action || "MONITOR",
+          anomalies: Array.isArray(payload?.anomalies) ? payload.anomalies : [],
+          timestamp: payload?.timestamp || nowLabel(),
+          color,
+        },
+        ...prev,
+      ].slice(0, 20));
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [apiBaseUrl]);
 
   const callPredict = async (payload) => {
     const response = await fetch(`${apiBaseUrl}/predict`, {
@@ -1000,6 +1150,8 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
           </ResponsiveContainer>
         </div>
       </section>
+
+      <InsiderThreatMonitor alerts={insiderAlerts} />
     </div>
   );
 }
