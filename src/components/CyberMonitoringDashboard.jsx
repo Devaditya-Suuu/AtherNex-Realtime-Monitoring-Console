@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { gsap } from "gsap";
 import {
   CartesianGrid,
-  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -12,18 +11,128 @@ import {
 } from "recharts";
 
 const SEVERITY_COLORS = {
-  normal: "#18a058",
-  warning: "#d69410",
-  critical: "#df3f40",
+  normal: "#20c997",
+  warning: "#f59e0b",
+  critical: "#ef4444",
 };
 
-const INITIAL_FORM = {
-  response_time_ms: 120,
-  cpu_usage: 26,
-  memory_usage: 38,
-  retry_count: 0,
-  status_code: 200,
+const SCENARIOS = {
+  normal: {
+    label: "Normal Traffic",
+    tone: "normal",
+    description: "Baseline web/API traffic with stable system metrics.",
+    steps: [
+      "Normal API requests observed",
+      "Authentication requests within normal range",
+      "No anomalies detected by sensor mesh",
+    ],
+    series: [12, 14, 18, 21, 17],
+    payload: {
+      response_time_ms: 120,
+      cpu_usage: 22,
+      memory_usage: 35,
+      retry_count: 0,
+      status_code: 200,
+      message: "normal traffic and healthy auth patterns",
+    },
+  },
+  bruteForce: {
+    label: "Brute Force",
+    tone: "critical",
+    description: "Repeated login failures and rapid retries from a single source.",
+    steps: [
+      "Normal traffic begins",
+      "Failed login attempts increase",
+      "Retry burst detected from same IP",
+      "Authentication source flagged for blocking",
+    ],
+    series: [12, 28, 45, 78, 91],
+    payload: {
+      response_time_ms: 3200,
+      cpu_usage: 78,
+      memory_usage: 64,
+      retry_count: 19,
+      status_code: 401,
+      message: "multiple failed login attempts and rapid retries",
+    },
+  },
+  ddos: {
+    label: "DDoS",
+    tone: "critical",
+    description: "Volumetric request flood causing resource pressure and latency spikes.",
+    steps: [
+      "Internet node receives unusual burst",
+      "Firewall rate limiting engaged",
+      "Server latency spikes across clusters",
+      "Traffic source quarantined",
+    ],
+    series: [18, 36, 63, 84, 96],
+    payload: {
+      response_time_ms: 5400,
+      cpu_usage: 96,
+      memory_usage: 92,
+      retry_count: 5,
+      status_code: 503,
+      message: "volumetric traffic flood consistent with DDoS",
+    },
+  },
+  sqlInjection: {
+    label: "SQL Injection",
+    tone: "warning",
+    description: "Suspicious payloads probing input fields and database endpoints.",
+    steps: [
+      "Unusual parameter strings observed",
+      "WAF pattern match fired",
+      "Database query anomalies detected",
+      "Malicious payload blocked",
+    ],
+    series: [14, 30, 52, 69, 86],
+    payload: {
+      response_time_ms: 1900,
+      cpu_usage: 66,
+      memory_usage: 58,
+      retry_count: 8,
+      status_code: 403,
+      message: "payload contains SQL injection markers and probes",
+    },
+  },
+  insiderThreat: {
+    label: "Insider Threat",
+    tone: "critical",
+    description: "Authenticated user access with abnormal access patterns and retries.",
+    steps: [
+      "Trusted session active",
+      "Access pattern diverges from baseline",
+      "Multiple high-risk actions triggered",
+      "Session terminated and source blocked",
+    ],
+    series: [16, 29, 43, 71, 89],
+    payload: {
+      response_time_ms: 2200,
+      cpu_usage: 71,
+      memory_usage: 67,
+      retry_count: 12,
+      status_code: 500,
+      message: "trusted user with abnormal access pattern",
+    },
+  },
 };
+
+const NETWORK_NODES = [
+  { id: "internet", label: "Internet", x: 12, y: 50 },
+  { id: "firewall", label: "Firewall", x: 34, y: 50 },
+  { id: "server1", label: "Server 1", x: 58, y: 30 },
+  { id: "server2", label: "Server 2", x: 58, y: 70 },
+  { id: "database", label: "Database", x: 82, y: 50 },
+];
+
+const NETWORK_EDGES = [
+  ["internet", "firewall"],
+  ["firewall", "server1"],
+  ["firewall", "server2"],
+  ["server1", "database"],
+  ["server2", "database"],
+];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -31,16 +140,321 @@ function nowLabel() {
   return new Date().toLocaleTimeString();
 }
 
-function mapStatusToSeverity(statusText) {
+function createInitialMetrics() {
+  return {
+    response_time_ms: 120,
+    cpu_usage: 22,
+    memory_usage: 35,
+    retry_count: 0,
+    status_code: 200,
+    activeScenario: "normal",
+  };
+}
+
+function severityFromStatus(statusText) {
   if ((statusText || "").includes("HIGH")) return "critical";
   if ((statusText || "").includes("MEDIUM")) return "warning";
   return "normal";
 }
 
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function getRouteForScenario(key) {
+  if (key === "ddos") return ["internet", "firewall", "server1", "database"];
+  if (key === "sqlInjection") return ["internet", "firewall", "server2", "database"];
+  if (key === "insiderThreat") return ["server2", "database"];
+  if (key === "bruteForce") return ["internet", "firewall", "server1"];
+  return ["internet", "firewall", "server1"];
+}
+
+function routeToEdges(route) {
+  return route.slice(0, -1).map((from, index) => ({
+    from,
+    to: route[index + 1],
+  }));
+}
+
+function getNodePosition(id) {
+  return NETWORK_NODES.find((node) => node.id === id) || NETWORK_NODES[0];
+}
+
+function ScenarioPills({ scenario, setScenario, running }) {
+  return (
+    <div style={scenarioStripStyle}>
+      {Object.entries(SCENARIOS).map(([key, item]) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => setScenario(key)}
+          disabled={running}
+          style={{
+            ...scenarioPillStyle,
+            borderColor: scenario === key ? item.tone === "critical" ? "rgba(248,113,113,0.8)" : "rgba(34,197,94,0.7)" : "rgba(148,163,184,0.28)",
+            background:
+              scenario === key
+                ? item.tone === "critical"
+                  ? "linear-gradient(135deg, rgba(127,29,29,0.88), rgba(220,38,38,0.84))"
+                  : "linear-gradient(135deg, rgba(6,95,70,0.88), rgba(20,184,166,0.78))"
+                : "rgba(15,23,42,0.78)",
+            color: scenario === key ? "#fff" : "#cbd5e1",
+          }}
+        >
+          {item.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function AttackSurfacePanel({ metrics, trend }) {
+  const arrow = (current, previous) => {
+    if (current > previous) return "▲";
+    if (current < previous) return "▼";
+    return "•";
+  };
+
+  const colorByTrend = (current, previous) => {
+    if (current > previous) return SEVERITY_COLORS.critical;
+    if (current < previous) return SEVERITY_COLORS.normal;
+    return "#94a3b8";
+  };
+
+  return (
+    <section className="anim-panel panel-card" style={panelStyle}>
+      <div className="panel-head">
+        <h3 style={panelTitleStyle}>Current Attack Surface</h3>
+        <span className="subtle-tag">Auto-updating</span>
+      </div>
+      <div style={metricsGridStyle}>
+        <MetricCard
+          label="Response Time"
+          value={`${metrics.response_time_ms} ms`}
+          delta={arrow(metrics.response_time_ms, trend.response_time_ms)}
+          deltaColor={colorByTrend(metrics.response_time_ms, trend.response_time_ms)}
+        />
+        <MetricCard
+          label="CPU Usage"
+          value={`${metrics.cpu_usage}%`}
+          delta={arrow(metrics.cpu_usage, trend.cpu_usage)}
+          deltaColor={colorByTrend(metrics.cpu_usage, trend.cpu_usage)}
+        />
+        <MetricCard
+          label="Memory Usage"
+          value={`${metrics.memory_usage}%`}
+          delta={arrow(metrics.memory_usage, trend.memory_usage)}
+          deltaColor={colorByTrend(metrics.memory_usage, trend.memory_usage)}
+        />
+        <MetricCard
+          label="Retry Count"
+          value={metrics.retry_count}
+          delta={arrow(metrics.retry_count, trend.retry_count)}
+          deltaColor={colorByTrend(metrics.retry_count, trend.retry_count)}
+        />
+      </div>
+    </section>
+  );
+}
+
+function MetricCard({ label, value, delta, deltaColor }) {
+  return (
+    <div style={metricCardStyle}>
+      <div style={{ ...metricLabelStyle }}>{label}</div>
+      <div style={metricValueStyle}>{value}</div>
+      <div style={{ ...metricDeltaStyle, color: deltaColor }}>{delta}</div>
+    </div>
+  );
+}
+
+function NetworkMap({ activeNode = "internet", breached = false, attackPath = null }) {
+  const pathSegments = attackPath?.route?.length > 1 ? routeToEdges(attackPath.route) : [];
+  const attackProgress = attackPath?.progress ?? 0;
+  const packetCount = attackPath?.pulseCount ?? 2;
+
+  return (
+    <section className="anim-panel panel-card" style={panelStyle}>
+      <div className="panel-head">
+        <h3 style={panelTitleStyle}>Network Map</h3>
+        <span className="subtle-tag">Live topology</span>
+      </div>
+      <div style={networkMapWrapStyle}>
+        <svg viewBox="0 0 100 100" style={networkSvgStyle}>
+          <defs>
+            <linearGradient id="attackGlow" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="#f8fafc" stopOpacity="0.95" />
+              <stop offset="35%" stopColor="#38bdf8" stopOpacity="0.95" />
+              <stop offset="70%" stopColor="#f59e0b" stopOpacity="0.95" />
+              <stop offset="100%" stopColor="#ef4444" stopOpacity="0.98" />
+            </linearGradient>
+            <filter id="attackBlur" x="-30%" y="-30%" width="160%" height="160%">
+              <feGaussianBlur stdDeviation="1.4" />
+            </filter>
+          </defs>
+
+          {NETWORK_EDGES.map(([from, to]) => {
+            const source = NETWORK_NODES.find((n) => n.id === from);
+            const target = NETWORK_NODES.find((n) => n.id === to);
+            const edgeActive = activeNode === from || activeNode === to || breached;
+            return (
+              <line
+                key={`${from}-${to}`}
+                x1={source.x}
+                y1={source.y}
+                x2={target.x}
+                y2={target.y}
+                stroke={edgeActive ? (breached ? "#ef4444" : "#38bdf8") : "#334155"}
+                strokeWidth={edgeActive ? 1.9 : 1.1}
+                strokeDasharray={breached ? "2 2" : "0"}
+                opacity={edgeActive ? 1 : 0.55}
+              />
+            );
+          })}
+
+          {pathSegments.map((segment, index) => {
+            const source = getNodePosition(segment.from);
+            const target = getNodePosition(segment.to);
+            const segmentActive = attackPath && attackProgress >= index;
+
+            return (
+              <g key={`${segment.from}-${segment.to}`}>
+                <line
+                  x1={source.x}
+                  y1={source.y}
+                  x2={target.x}
+                  y2={target.y}
+                  stroke={segmentActive ? "url(#attackGlow)" : "#1f2937"}
+                  strokeWidth={segmentActive ? 3.2 : 1.4}
+                  strokeLinecap="round"
+                  strokeDasharray={segmentActive ? "4 4" : "0"}
+                  opacity={segmentActive ? 1 : 0.35}
+                />
+                {segmentActive ? (
+                  <line
+                    x1={source.x}
+                    y1={source.y}
+                    x2={target.x}
+                    y2={target.y}
+                    stroke={breached ? "#ef4444" : "#38bdf8"}
+                    strokeWidth={1.1}
+                    strokeLinecap="round"
+                    opacity={0.78}
+                    style={{
+                      strokeDasharray: 16,
+                      strokeDashoffset: attackPath?.pulseTick ? 16 - (attackPath.pulseTick % 16) : 0,
+                    }}
+                  />
+                ) : null}
+              </g>
+            );
+          })}
+
+          {pathSegments.map((segment, index) => {
+            if (!attackPath || attackProgress < index) return null;
+            const source = getNodePosition(segment.from);
+            const target = getNodePosition(segment.to);
+            const factor = clamp(attackProgress - index, 0, 1);
+            const x = source.x + (target.x - source.x) * factor;
+            const y = source.y + (target.y - source.y) * factor;
+            return (
+              <circle
+                key={`packet-${segment.from}-${segment.to}`}
+                cx={x}
+                cy={y}
+                r={index === pathSegments.length - 1 && breached ? 4.3 : 3.2}
+                fill={index === pathSegments.length - 1 && breached ? "#ef4444" : "#38bdf8"}
+                filter="url(#attackBlur)"
+                opacity={0.95}
+              />
+            );
+          })}
+
+          {attackPath ? (
+            <g opacity="0.95">
+              {Array.from({ length: packetCount }).map((_, index) => {
+                const orbit = (attackProgress + index * 0.32) % Math.max(pathSegments.length, 1);
+                const segmentIndex = Math.min(pathSegments.length - 1, Math.floor(orbit));
+                const segment = pathSegments[segmentIndex];
+                if (!segment) return null;
+                const source = getNodePosition(segment.from);
+                const target = getNodePosition(segment.to);
+                const localProgress = orbit - segmentIndex;
+                const x = source.x + (target.x - source.x) * localProgress;
+                const y = source.y + (target.y - source.y) * localProgress;
+                return (
+                  <circle
+                    key={`pulse-${index}`}
+                    cx={x}
+                    cy={y}
+                    r={index % 2 === 0 ? 1.6 : 2}
+                    fill={index % 2 === 0 ? "#f8fafc" : "#f59e0b"}
+                    filter="url(#attackBlur)"
+                    opacity={0.8}
+                  />
+                );
+              })}
+            </g>
+          ) : null}
+
+          {NETWORK_NODES.map((node) => {
+            const isActive = activeNode === node.id;
+            const isBreach = breached && node.id === "internet";
+            const isRouteNode = attackPath?.route?.includes(node.id);
+            return (
+              <g key={node.id} transform={`translate(${node.x}, ${node.y})`}>
+                {isRouteNode ? (
+                  <circle
+                    r={8.8}
+                    fill="none"
+                    stroke={breached ? "#ef4444" : "#38bdf8"}
+                    strokeOpacity="0.35"
+                    strokeWidth="0.9"
+                  />
+                ) : null}
+                <circle
+                  r={isActive || isRouteNode ? 7.6 : 6}
+                  fill={isBreach ? "#ef4444" : isActive ? "#38bdf8" : "#0f172a"}
+                  stroke={isBreach ? "#fecaca" : isRouteNode ? "#7dd3fc" : isActive ? "#fff" : "#64748b"}
+                  strokeWidth={isRouteNode ? 1.5 : 1}
+                  filter={isActive || isRouteNode ? "url(#attackBlur)" : undefined}
+                />
+                {isRouteNode ? (
+                  <circle
+                    r={11.5}
+                    fill="none"
+                    stroke={breached ? "#ef4444" : "#38bdf8"}
+                    strokeOpacity="0.22"
+                    strokeDasharray="2 3"
+                    strokeWidth="0.8"
+                  >
+                    <animate attributeName="r" values="10;13;10" dur="1.4s" repeatCount="indefinite" />
+                    <animate attributeName="stroke-opacity" values="0.1;0.5;0.1" dur="1.4s" repeatCount="indefinite" />
+                  </circle>
+                ) : null}
+                <text x="0" y="16" textAnchor="middle" fill="#cbd5e1" fontSize="3.2" fontWeight="600">
+                  {node.label}
+                </text>
+                {isBreach && (
+                  <text x="0" y="-10" textAnchor="middle" fill="#f87171" fontSize="6" fontWeight="800">
+                    X
+                  </text>
+                )}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+    </section>
+  );
+}
+
 function LogsPanel({ logs, logsRef }) {
   return (
-    <section className="anim-panel" style={panelStyle}>
-      <h3 style={panelTitleStyle}>Live System Logs</h3>
+    <section className="anim-panel panel-card" style={panelStyle}>
+      <div className="panel-head">
+        <h3 style={panelTitleStyle}>Live System Logs</h3>
+        <span className="subtle-tag">Auto-feed</span>
+      </div>
       <div ref={logsRef} style={logsContainerStyle}>
         {logs.map((log) => (
           <div key={log.id} className="log-item" style={logRowStyle}>
@@ -57,37 +471,36 @@ function LogsPanel({ logs, logsRef }) {
   );
 }
 
-function ResultPanel({ prediction, loading, error, simulating }) {
+function ResultPanel({ prediction, scenario, loading, simulating, error, timeline }) {
   const meterRef = useRef(null);
-
   const statusColor = useMemo(() => {
-    if (!prediction?.status) return "#67778a";
+    if (!prediction?.status) return "#94a3b8";
     if (prediction.status === "SAFE") return SEVERITY_COLORS.normal;
     if (prediction.status === "MEDIUM RISK") return SEVERITY_COLORS.warning;
     return SEVERITY_COLORS.critical;
   }, [prediction]);
 
   const score = Math.max(0, Math.min(100, Number(prediction?.risk_score || 0)));
+  const scenarioTone = SCENARIOS[scenario]?.tone || "normal";
 
   useEffect(() => {
     if (!meterRef.current) return;
-
     gsap.to(meterRef.current, {
       width: `${score}%`,
-      duration: 0.7,
+      duration: 0.8,
       ease: "power3.out",
     });
   }, [score]);
 
   useEffect(() => {
     if (!prediction?.status) return;
-
     gsap.fromTo(
       ".status-glow",
-      { boxShadow: `0 0 0 rgba(0,0,0,0)` },
+      { scale: 0.985, boxShadow: "0 0 0 rgba(0,0,0,0)" },
       {
-        boxShadow: `0 0 20px ${statusColor}55`,
-        duration: 0.35,
+        scale: 1,
+        boxShadow: `0 0 22px ${statusColor}55`,
+        duration: 0.45,
         yoyo: true,
         repeat: 1,
         ease: "power1.out",
@@ -96,102 +509,67 @@ function ResultPanel({ prediction, loading, error, simulating }) {
   }, [prediction, statusColor]);
 
   return (
-    <section className="anim-panel" style={panelStyle}>
-      <h3 style={panelTitleStyle}>Threat Assessment</h3>
+    <section className="anim-panel panel-card" style={panelStyle}>
+      <div className="panel-head">
+        <h3 style={panelTitleStyle}>Incident Response</h3>
+        <span className="subtle-tag">{SCENARIOS[scenario]?.label || "Scenario"}</span>
+      </div>
 
-      {loading ? <div style={mutedStyle}>Scoring request...</div> : null}
-      {simulating ? <div style={mutedStyle}>Running staged attack simulation...</div> : null}
-      {error ? <div style={{ ...mutedStyle, color: SEVERITY_COLORS.critical }}>{error}</div> : null}
-
-      <div className="status-glow" style={{ ...resultCardStyle, borderColor: `${statusColor}66` }}>
-        <div style={{ ...statusStyle, color: statusColor }}>
-          {prediction?.status || "Awaiting prediction"}
+      <div className={`status-glow incident-${scenarioTone}`} style={{ ...incidentBannerStyle, borderColor: `${statusColor}55` }}>
+        <div style={{ ...incidentStatusStyle, color: statusColor }}>
+          {prediction?.status || "Awaiting scenario run"}
         </div>
-        <div style={{ fontSize: 13, color: "#465a72", marginTop: 8 }}>
-          Action: <strong>{prediction?.action || "-"}</strong>
-        </div>
-        <div style={{ fontSize: 13, color: "#465a72", marginTop: 2 }}>
-          Confidence: {typeof prediction?.confidence === "number" ? `${(prediction.confidence * 100).toFixed(1)}%` : "-"}
-        </div>
+        <div style={incidentMetaStyle}>Action: <strong>{prediction?.action || "-"}</strong></div>
+        <div style={incidentMetaStyle}>Confidence: {typeof prediction?.confidence === "number" ? `${(prediction.confidence * 100).toFixed(1)}%` : "-"}</div>
         <div style={{ marginTop: 12 }}>
-          <div style={{ fontSize: 13, color: "#465a72" }}>Risk Score: {score.toFixed(1)}/100</div>
+          <div style={incidentMetaStyle}>Risk Score: {score.toFixed(1)}/100</div>
           <div style={meterOuterStyle}>
             <div
               ref={meterRef}
-              style={{
-                ...meterInnerStyle,
-                width: "0%",
-                background: "linear-gradient(90deg, #18a058, #d69410, #df3f40)",
-              }}
+              style={{ ...meterInnerStyle, width: "0%", background: "linear-gradient(90deg, #20c997, #f59e0b, #ef4444)" }}
             />
           </div>
         </div>
       </div>
-    </section>
-  );
-}
 
-function ChartsPanel({ riskHistory, metricsHistory }) {
-  return (
-    <section className="anim-panel" style={panelStyle}>
-      <h3 style={panelTitleStyle}>Risk Score Over Time</h3>
-      <div style={{ width: "100%", height: 220 }}>
-        <ResponsiveContainer>
-          <LineChart data={riskHistory}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#dce4ef" />
-            <XAxis dataKey="time" stroke="#9bb0d1" />
-            <YAxis domain={[0, 100]} stroke="#9bb0d1" />
-            <Tooltip
-              contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8 }}
-              labelStyle={{ color: "#cbd5e1" }}
-              itemStyle={{ color: "#e2e8f0" }}
-            />
-            <Line type="monotone" dataKey="risk" stroke="#00a39a" strokeWidth={2.4} dot={false} />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
+      {loading ? <div style={noticeStyle}>Contacting model...</div> : null}
+      {simulating ? <div style={{ ...noticeStyle, color: "#f59e0b" }}>Running live incident simulation...</div> : null}
+      {error ? <div style={{ ...noticeStyle, color: "#f87171" }}>{error}</div> : null}
 
-      <h3 style={{ ...panelTitleStyle, marginTop: 12 }}>System Metrics</h3>
-      <div style={{ width: "100%", height: 220 }}>
-        <ResponsiveContainer>
-          <LineChart data={metricsHistory}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#dce4ef" />
-            <XAxis dataKey="time" stroke="#9bb0d1" />
-            <YAxis domain={[0, 100]} stroke="#9bb0d1" />
-            <Tooltip
-              contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 8 }}
-              labelStyle={{ color: "#cbd5e1" }}
-              itemStyle={{ color: "#e2e8f0" }}
-            />
-            <Legend wrapperStyle={{ color: "#e2e8f0" }} />
-            <Line type="monotone" dataKey="cpu" stroke="#3478f6" strokeWidth={2.2} dot={false} name="CPU %" />
-            <Line type="monotone" dataKey="memory" stroke="#8d36f0" strokeWidth={2.2} dot={false} name="Memory %" />
-          </LineChart>
-        </ResponsiveContainer>
+      <div style={timelineMiniWrapStyle}>
+        {timeline.slice(-6).map((item) => (
+          <div key={item.id} style={timelineMiniItemStyle}>
+            <span style={{ color: SEVERITY_COLORS[item.severity], fontWeight: 800 }}>[{item.severity.toUpperCase()}]</span>
+            <span style={{ color: "#cbd5e1" }}>{item.message}</span>
+          </div>
+        ))}
       </div>
     </section>
   );
 }
 
-function StatCards({ prediction, logs }) {
-  const criticalCount = logs.filter((l) => l.severity === "critical").length;
-  const warningCount = logs.filter((l) => l.severity === "warning").length;
-
+function ThreatTimeline({ events }) {
   return (
-    <div className="anim-panel" style={statsGridStyle}>
-      <div style={statCardStyle}>
-        <div style={statLabelStyle}>Current Status</div>
-        <div style={statValueStyle}>{prediction?.status || "IDLE"}</div>
+    <section className="anim-panel panel-card" style={{ ...panelStyle, marginTop: 2 }}>
+      <div className="panel-head">
+        <h3 style={panelTitleStyle}>Threat Timeline</h3>
+        <span className="subtle-tag">Narrative view</span>
       </div>
-      <div style={statCardStyle}>
-        <div style={statLabelStyle}>Critical Events</div>
-        <div style={{ ...statValueStyle, color: SEVERITY_COLORS.critical }}>{criticalCount}</div>
+      <div style={timelineWrapStyle}>
+        {events.map((event, index) => (
+          <div key={event.id} style={timelineItemWrapStyle}>
+            <div style={{ ...timelineDotStyle, background: SEVERITY_COLORS[event.severity] }} />
+            <div style={timelineTextStyle}>
+              <div style={{ color: SEVERITY_COLORS[event.severity], fontWeight: 800 }}>
+                [{event.timestamp}] {event.tag}
+              </div>
+              <div style={{ color: "#cbd5e1", marginTop: 4 }}>{event.message}</div>
+            </div>
+            {index < events.length - 1 && <div style={timelineConnectorStyle} />}
+          </div>
+        ))}
       </div>
-      <div style={statCardStyle}>
-        <div style={statLabelStyle}>Warning Events</div>
-        <div style={{ ...statValueStyle, color: SEVERITY_COLORS.warning }}>{warningCount}</div>
-      </div>
-    </div>
+    </section>
   );
 }
 
@@ -199,8 +577,12 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
   const rootRef = useRef(null);
   const logsRef = useRef(null);
   const pulseRef = useRef(null);
+  const attackTimerRef = useRef(null);
+  const liveFeedTimerRef = useRef(null);
 
-  const [formData, setFormData] = useState(INITIAL_FORM);
+  const [scenario, setScenario] = useState("normal");
+  const [metrics, setMetrics] = useState(createInitialMetrics());
+  const [trend, setTrend] = useState(createInitialMetrics());
   const [prediction, setPrediction] = useState(null);
   const [loading, setLoading] = useState(false);
   const [simulating, setSimulating] = useState(false);
@@ -210,40 +592,54 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
   ]);
   const [riskHistory, setRiskHistory] = useState([]);
   const [metricsHistory, setMetricsHistory] = useState([]);
+  const [timeline, setTimeline] = useState([]);
+  const [networkFocus, setNetworkFocus] = useState("internet");
+  const [breached, setBreached] = useState(false);
+  const [attackPath, setAttackPath] = useState(null);
 
   const addLog = (message, severity = "normal") => {
     setLogs((prev) => {
-      const next = [
-        ...prev,
-        { id: Date.now() + Math.random(), timestamp: nowLabel(), message, severity },
-      ];
-      return next.slice(-140);
+      const next = [...prev, { id: Date.now() + Math.random(), timestamp: nowLabel(), message, severity }];
+      return next.slice(-160);
     });
   };
 
+  const addTimelineEvent = (tag, message, severity = "normal") => {
+    setTimeline((prev) => [
+      ...prev,
+      { id: Date.now() + Math.random(), timestamp: nowLabel(), tag, message, severity },
+    ].slice(-12));
+  };
+
+  const updateMetrics = (nextMetrics) => {
+    setTrend((prev) => ({ ...metrics }));
+    setMetrics(nextMetrics);
+    setMetricsHistory((prev) => [
+      ...prev.slice(-39),
+      { time: nowLabel(), cpu: Number(nextMetrics.cpu_usage), memory: Number(nextMetrics.memory_usage) },
+    ]);
+  };
+
   useEffect(() => {
-    // Entry animation for main dashboard sections.
     const ctx = gsap.context(() => {
       gsap.from(".anim-hero", {
         y: -18,
         opacity: 0,
-        duration: 0.65,
+        duration: 0.7,
         ease: "power3.out",
       });
-
       gsap.from(".anim-panel", {
-        y: 16,
+        y: 18,
         opacity: 0,
         stagger: 0.08,
         duration: 0.65,
         delay: 0.08,
         ease: "power2.out",
       });
-
       if (pulseRef.current) {
         gsap.to(pulseRef.current, {
-          scale: 1.22,
-          opacity: 0.5,
+          scale: 1.2,
+          opacity: 0.45,
           repeat: -1,
           yoyo: true,
           duration: 0.9,
@@ -255,19 +651,18 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
     return () => ctx.revert();
   }, []);
 
-  // Auto-scroll log feed and animate newest row.
   useEffect(() => {
-    if (logsRef.current) {
-      logsRef.current.scrollTop = logsRef.current.scrollHeight;
-      const last = logsRef.current.querySelector(".log-item:last-child");
-      if (last) {
-        gsap.fromTo(last, { x: -10, opacity: 0 }, { x: 0, opacity: 1, duration: 0.28, ease: "power1.out" });
-      }
+    if (!logsRef.current) return;
+    logsRef.current.scrollTop = logsRef.current.scrollHeight;
+    const last = logsRef.current.querySelector(".log-item:last-child");
+    if (last) {
+      gsap.fromTo(last, { x: -14, opacity: 0.4 }, { x: 0, opacity: 1, duration: 0.25, ease: "power1.out" });
     }
   }, [logs]);
 
-  // Real-time autonomous system log stream.
   useEffect(() => {
+    if (simulating) return;
+
     const pool = [
       { message: "Normal API request", severity: "normal" },
       { message: "Session token validated", severity: "normal" },
@@ -277,32 +672,42 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
       { message: "Unusual retry burst detected", severity: "critical" },
     ];
 
-    const timer = setInterval(() => {
-      if (simulating) return;
+    liveFeedTimerRef.current = setInterval(() => {
       const item = pool[Math.floor(Math.random() * pool.length)];
       addLog(item.message, item.severity);
+
+      setMetrics((prev) => {
+        const cpu = clamp(prev.cpu_usage + (Math.random() * 6 - 2), 8, 100);
+        const memory = clamp(prev.memory_usage + (Math.random() * 4 - 1), 10, 100);
+        const responseTime = clamp(prev.response_time_ms + (Math.random() * 180 - 80), 85, 9999);
+        return {
+          ...prev,
+          cpu_usage: Math.round(cpu),
+          memory_usage: Math.round(memory),
+          response_time_ms: Math.round(responseTime),
+          retry_count: prev.retry_count,
+        };
+      });
     }, 2500);
 
-    return () => clearInterval(timer);
+    return () => clearInterval(liveFeedTimerRef.current);
   }, [simulating]);
 
-  const onInputChange = (event) => {
-    const { name, value } = event.target;
-    setFormData((prev) => ({ ...prev, [name]: value }));
-  };
-
-  const appendCharts = (payload, result) => {
-    const pointTime = nowLabel();
-    setRiskHistory((prev) => [...prev.slice(-39), { time: pointTime, risk: Number(result.risk_score || 0) }]);
-    setMetricsHistory((prev) => [
-      ...prev.slice(-39),
-      {
-        time: pointTime,
-        cpu: Number(payload.cpu_usage || 0),
-        memory: Number(payload.memory_usage || 0),
-      },
-    ]);
-  };
+  useEffect(() => {
+    const current = SCENARIOS[scenario];
+    setBreached(false);
+    setNetworkFocus("internet");
+    setAttackPath(null);
+    setMetrics((prev) => ({
+      ...prev,
+      activeScenario: scenario,
+      response_time_ms: current.payload.response_time_ms,
+      cpu_usage: current.payload.cpu_usage,
+      memory_usage: current.payload.memory_usage,
+      retry_count: current.payload.retry_count,
+      status_code: current.payload.status_code,
+    }));
+  }, [scenario]);
 
   const callPredict = async (payload) => {
     const response = await fetch(`${apiBaseUrl}/predict`, {
@@ -310,26 +715,28 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-
     const body = await response.json();
     if (!response.ok) {
       throw new Error(body?.detail || "Prediction failed");
     }
-
     return body;
   };
 
-  const runPrediction = async (payload, sourceLabel = "Manual prediction") => {
+  const runPrediction = async (payload, sourceLabel = "Scenario") => {
     setLoading(true);
     setError("");
 
     try {
       const result = await callPredict(payload);
       setPrediction(result);
-      appendCharts(payload, result);
-
-      const severity = mapStatusToSeverity(result.status);
+      setRiskHistory((prev) => [...prev.slice(-39), { time: nowLabel(), risk: Number(result.risk_score || 0) }]);
+      const severity = severityFromStatus(result.status);
       addLog(`${sourceLabel} -> ${result.status} (${result.action})`, severity);
+      addTimelineEvent(result.status, `${sourceLabel} ended with ${result.action}`, severity);
+      if (result.status === "HIGH RISK") {
+        setBreached(true);
+        setNetworkFocus("firewall");
+      }
       return result;
     } catch (err) {
       const message = err.message || "Unable to reach backend";
@@ -341,135 +748,144 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
     }
   };
 
-  const handleRunPrediction = async (event) => {
-    event.preventDefault();
-
-    const payload = {
-      response_time_ms: Number(formData.response_time_ms),
-      cpu_usage: Number(formData.cpu_usage),
-      memory_usage: Number(formData.memory_usage),
-      retry_count: Number(formData.retry_count),
-      status_code: Number(formData.status_code),
-      message: "manual dashboard prediction",
-    };
-
-    await runPrediction(payload);
-  };
-
-  const runAttackSimulation = async () => {
+  const simulateScenario = async (key) => {
+    if (attackTimerRef.current) {
+      clearTimeout(attackTimerRef.current);
+    }
     if (simulating || loading) return;
 
+    const selected = SCENARIOS[key];
+    setScenario(key);
     setSimulating(true);
     setError("");
+    setBreached(false);
+    const selectedRoute = getRouteForScenario(key);
+    const routeSegments = routeToEdges(selectedRoute);
 
     try {
-      addLog("Simulation started: baseline traffic", "normal");
-      await sleep(1000);
+      addTimelineEvent("START", `Scenario selected: ${selected.label}`, "normal");
+      addLog(`Scenario engaged: ${selected.label}`, "normal");
+      await sleep(900);
 
-      addLog("Step 1: Normal API traffic stabilized", "normal");
-      await sleep(1000);
+      const replaySeries = selected.series;
+      for (let i = 0; i < replaySeries.length; i += 1) {
+        const nextRisk = replaySeries[i];
+        const current = selected.payload;
 
-      addLog("Step 2: CPU usage spike detected", "warning");
-      setFormData((prev) => ({ ...prev, cpu_usage: 88, memory_usage: 72 }));
-      await sleep(1100);
+        setNetworkFocus(i < 1 ? selectedRoute[0] : i < 3 ? selectedRoute[Math.min(1, selectedRoute.length - 1)] : selectedRoute[selectedRoute.length - 1]);
+        setAttackPath({
+          route: selectedRoute,
+          progress: Math.min(routeSegments.length, i * 0.8 + 0.25),
+          pulseCount: key === "ddos" ? 4 : 3,
+          pulseTick: i * 3,
+        });
+        setMetrics((prev) => ({
+          ...prev,
+          activeScenario: key,
+          response_time_ms: clamp(current.response_time_ms + i * 180, 85, 9999),
+          cpu_usage: clamp(current.cpu_usage - 16 + i * 9, 8, 100),
+          memory_usage: clamp(current.memory_usage - 10 + i * 7, 10, 100),
+          retry_count: current.retry_count + i * (key === "normal" ? 0 : 2),
+          status_code: current.status_code,
+        }));
 
-      addLog("Step 3: Retry count surge detected", "critical");
-      setFormData((prev) => ({ ...prev, retry_count: 14, status_code: 503, response_time_ms: 4500 }));
-      await sleep(1100);
+        if (i === 1) addLog("Telemetry drift detected", "warning");
+        if (i === 2) addLog("Firewall rules escalating", "warning");
+        if (i === 3) addLog("Threat classifier confidence rising", "critical");
+        if (i === 4) addLog("Preparing automated response", "critical");
 
-      const maliciousPayload = {
-        response_time_ms: 5000,
-        cpu_usage: 95,
-        memory_usage: 98,
-        retry_count: 15,
-        status_code: 503,
-        message: "multiple failed login attempts and suspicious retries",
-      };
+        setRiskHistory((prev) => [...prev.slice(-39), { time: nowLabel(), risk: nextRisk }]);
+        addTimelineEvent(
+          i === replaySeries.length - 1 ? "BLOCKED" : i < 2 ? "WATCH" : i < 4 ? "ALERT" : "CRITICAL",
+          `Risk progressed to ${nextRisk}/100`,
+          nextRisk > 70 ? "critical" : nextRisk > 35 ? "warning" : "normal"
+        );
 
-      addLog("Step 4: Executing backend threat prediction", "critical");
-      const result = await runPrediction(maliciousPayload, "Simulation");
+        await sleep(850);
+      }
 
+      const result = await runPrediction(selected.payload, selected.label);
       if (result.status === "HIGH RISK") {
-        addLog("Step 5: Threat confirmed -> BLOCK IP", "critical");
-      } else {
-        addLog("Step 5: Elevated but non-critical response", "warning");
+        setNetworkFocus("internet");
+        setAttackPath({
+          route: selectedRoute,
+          progress: routeSegments.length,
+          pulseCount: key === "ddos" ? 5 : 3,
+          pulseTick: routeSegments.length * 4,
+        });
+        addLog("Source IP blocked automatically", "critical");
+        addTimelineEvent("BLOCKED", "Source IP blocked automatically", "critical");
       }
     } catch (_err) {
-      // Errors are handled by runPrediction.
+      // handled in runPrediction
     } finally {
+      attackTimerRef.current = setTimeout(() => {
+        setAttackPath(null);
+      }, 1400);
       setSimulating(false);
     }
   };
 
   return (
-    <div
-      ref={rootRef}
-      style={{
-        ...rootStyle,
-        background:
-          "radial-gradient(circle at 10% 0%, #102a43 0%, transparent 30%), radial-gradient(circle at 90% 80%, #2d1b52 0%, transparent 26%), linear-gradient(180deg, #020617 0%, #0b1220 100%)",
-      }}
-    >
+    <div ref={rootRef} style={rootStyle}>
       <div className="anim-hero" style={heroStyle}>
         <div>
-          <h2 style={{ margin: 0 }}>AtherNex Realtime Monitoring Console</h2>
-          <p style={{ marginTop: 6, marginBottom: 0, color: "#516173" }}>
-            Live anomaly detection with backend-driven predictions, timeline logs, and telemetry charts.
+          <div style={eyebrowStyle}>AegisAI Monitoring</div>
+          <h1 style={{ margin: 0, fontSize: 28 }}>Realtime Threat Operations Console</h1>
+          <p style={{ marginTop: 8, marginBottom: 0, color: "#94a3b8", maxWidth: 760 }}>
+            Watch live attack scenarios unfold without manual input. Scenario-driven simulations stream metrics,
+            logs, threat scores, and auto-response actions in real time.
           </p>
         </div>
         <div style={liveBadgeStyle}>
           <span ref={pulseRef} style={pulseDotStyle} />
-          LIVE
+          LIVE THREAT FEED
         </div>
       </div>
 
-      <StatCards prediction={prediction} logs={logs} />
+      <ScenarioPills scenario={scenario} setScenario={simulateScenario} running={simulating || loading} />
 
-      <div style={gridStyle}>
-        <section className="anim-panel" style={panelStyle}>
-          <h3 style={panelTitleStyle}>Input Signals</h3>
-          <form onSubmit={handleRunPrediction} style={{ display: "grid", gap: 10 }}>
-            <InputRow label="Response Time (ms)" name="response_time_ms" value={formData.response_time_ms} onChange={onInputChange} />
-            <InputRow label="CPU Usage (%)" name="cpu_usage" value={formData.cpu_usage} onChange={onInputChange} />
-            <InputRow label="Memory Usage (%)" name="memory_usage" value={formData.memory_usage} onChange={onInputChange} />
-            <InputRow label="Retry Count" name="retry_count" value={formData.retry_count} onChange={onInputChange} />
-            <InputRow label="Status Code" name="status_code" value={formData.status_code} onChange={onInputChange} />
-
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 6 }}>
-              <button style={primaryButtonStyle} type="submit" disabled={loading || simulating}>
-                {loading ? "Running..." : "Run Prediction"}
-              </button>
-              <button style={secondaryButtonStyle} type="button" onClick={runAttackSimulation} disabled={loading || simulating}>
-                {simulating ? "Simulating..." : "Simulate Attack"}
-              </button>
-            </div>
-          </form>
-        </section>
-
-        <ResultPanel prediction={prediction} loading={loading} error={error} simulating={simulating} />
+      <div style={topGridStyle}>
+        <AttackSurfacePanel metrics={metrics} trend={trend} />
+        <NetworkMap activeNode={networkFocus} breached={breached} attackPath={attackPath} />
       </div>
 
       <div style={gridStyle}>
         <LogsPanel logs={logs} logsRef={logsRef} />
-        <ChartsPanel riskHistory={riskHistory} metricsHistory={metricsHistory} />
+        <ResultPanel prediction={prediction} scenario={scenario} loading={loading} simulating={simulating} error={error} timeline={timeline} />
       </div>
-    </div>
-  );
-}
 
-function InputRow({ label, name, value, onChange }) {
-  return (
-    <label style={inputRowStyle}>
-      <span style={inputLabelStyle}>{label}</span>
-      <input type="number" name={name} value={value} onChange={onChange} style={inputStyle} />
-    </label>
+      <ThreatTimeline events={timeline} />
+
+      <section className="anim-panel panel-card" style={{ ...panelStyle, marginTop: 14 }}>
+        <div className="panel-head">
+          <h3 style={panelTitleStyle}>Risk Score Over Time</h3>
+          <span className="subtle-tag">Animated response curve</span>
+        </div>
+        <div style={{ width: "100%", height: 240 }}>
+          <ResponsiveContainer>
+            <LineChart data={riskHistory}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#243244" />
+              <XAxis dataKey="time" stroke="#94a3b8" />
+              <YAxis domain={[0, 100]} stroke="#94a3b8" />
+              <Tooltip
+                contentStyle={{ background: "#0b1220", border: "1px solid #334155", borderRadius: 10 }}
+                labelStyle={{ color: "#cbd5e1" }}
+                itemStyle={{ color: "#e2e8f0" }}
+              />
+              <Line type="monotone" dataKey="risk" stroke="#00a39a" strokeWidth={2.6} dot={{ r: 2 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </section>
+    </div>
   );
 }
 
 const rootStyle = {
   fontFamily: "Space Grotesk, sans-serif",
   color: "#e2e8f0",
-  maxWidth: 1280,
+  maxWidth: 1440,
   margin: "0 auto",
   padding: 20,
   borderRadius: 18,
@@ -479,8 +895,17 @@ const heroStyle = {
   display: "flex",
   justifyContent: "space-between",
   alignItems: "center",
-  marginBottom: 12,
+  marginBottom: 14,
   gap: 12,
+};
+
+const eyebrowStyle = {
+  textTransform: "uppercase",
+  letterSpacing: 2,
+  color: "#38bdf8",
+  fontSize: 12,
+  fontWeight: 700,
+  marginBottom: 8,
 };
 
 const liveBadgeStyle = {
@@ -491,24 +916,233 @@ const liveBadgeStyle = {
   color: "#e2e8f0",
   borderRadius: 999,
   border: "1px solid rgba(148,163,184,0.26)",
-  padding: "8px 12px",
+  padding: "10px 14px",
   background: "rgba(15,23,42,0.92)",
   boxShadow: "0 7px 18px rgba(0,0,0,0.35)",
+  whiteSpace: "nowrap",
 };
 
 const pulseDotStyle = {
-  width: 9,
-  height: 9,
+  width: 10,
+  height: 10,
   borderRadius: "50%",
-  background: "#18a058",
+  background: "#20c997",
   display: "inline-block",
 };
 
-const statsGridStyle = {
+const scenarioStripStyle = {
   display: "grid",
-  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+  gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
   gap: 10,
   marginBottom: 14,
+};
+
+const scenarioPillStyle = {
+  borderRadius: 14,
+  border: "1px solid rgba(148,163,184,0.28)",
+  padding: "12px 10px",
+  cursor: "pointer",
+  fontWeight: 800,
+  boxShadow: "0 12px 28px rgba(0,0,0,0.18)",
+  transition: "transform 180ms ease, box-shadow 180ms ease, background 180ms ease",
+};
+
+const topGridStyle = {
+  display: "grid",
+  gridTemplateColumns: "1.1fr 0.9fr",
+  gap: 14,
+  marginBottom: 14,
+};
+
+const gridStyle = {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: 14,
+  marginBottom: 14,
+};
+
+const panelStyle = {
+  borderRadius: 18,
+  border: "1px solid rgba(148,163,184,0.18)",
+  background: "rgba(15,23,42,0.92)",
+  padding: 16,
+  minHeight: 250,
+  boxShadow: "0 18px 34px rgba(0,0,0,0.32)",
+};
+
+const panelTitleStyle = {
+  marginTop: 0,
+  marginBottom: 0,
+  fontSize: 16,
+  letterSpacing: 0.2,
+  color: "#f8fafc",
+};
+
+const metricsGridStyle = {
+  marginTop: 12,
+  display: "grid",
+  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+  gap: 10,
+};
+
+const metricCardStyle = {
+  borderRadius: 14,
+  padding: 12,
+  background: "rgba(2,6,23,0.9)",
+  border: "1px solid rgba(148,163,184,0.18)",
+};
+
+const metricLabelStyle = {
+  fontSize: 12,
+  color: "#94a3b8",
+};
+
+const metricValueStyle = {
+  fontSize: 19,
+  fontWeight: 800,
+  marginTop: 6,
+};
+
+const metricDeltaStyle = {
+  fontSize: 14,
+  fontWeight: 900,
+  marginTop: 4,
+};
+
+const networkMapWrapStyle = {
+  marginTop: 12,
+  minHeight: 270,
+  borderRadius: 14,
+  background: "radial-gradient(circle at 40% 20%, rgba(56,189,248,0.12), transparent 34%), linear-gradient(180deg, rgba(2,6,23,0.95), rgba(15,23,42,0.95))",
+  border: "1px solid rgba(148,163,184,0.16)",
+  overflow: "hidden",
+};
+
+const networkSvgStyle = {
+  width: "100%",
+  height: 270,
+  display: "block",
+};
+
+const logsContainerStyle = {
+  height: 450,
+  overflowY: "auto",
+  border: "1px solid rgba(148,163,184,0.18)",
+  borderRadius: 14,
+  padding: 12,
+  background: "rgba(2,6,23,0.9)",
+};
+
+const logRowStyle = {
+  display: "flex",
+  gap: 8,
+  fontSize: 13,
+  marginBottom: 8,
+  alignItems: "baseline",
+};
+
+const logTimestampStyle = {
+  fontFamily: "JetBrains Mono, monospace",
+  minWidth: 84,
+};
+
+const incidentBannerStyle = {
+  borderRadius: 14,
+  border: "1px solid rgba(148,163,184,0.18)",
+  background: "rgba(2,6,23,0.96)",
+  padding: 14,
+};
+
+const incidentStatusStyle = {
+  fontSize: 28,
+  fontWeight: 900,
+  letterSpacing: 1,
+};
+
+const incidentMetaStyle = {
+  fontSize: 13,
+  color: "#cbd5e1",
+  marginTop: 7,
+};
+
+const meterOuterStyle = {
+  marginTop: 6,
+  height: 11,
+  borderRadius: 999,
+  background: "#1e293b",
+  overflow: "hidden",
+};
+
+const meterInnerStyle = {
+  height: "100%",
+};
+
+const noticeStyle = {
+  marginTop: 10,
+  fontSize: 13,
+  color: "#94a3b8",
+};
+
+const timelineMiniWrapStyle = {
+  marginTop: 12,
+  display: "grid",
+  gap: 8,
+  paddingTop: 12,
+  borderTop: "1px solid rgba(148,163,184,0.14)",
+};
+
+const timelineMiniItemStyle = {
+  display: "grid",
+  gap: 4,
+  fontSize: 12,
+};
+
+const timelineWrapStyle = {
+  marginTop: 12,
+  borderRadius: 14,
+  background: "rgba(2,6,23,0.88)",
+  border: "1px solid rgba(148,163,184,0.18)",
+  padding: 14,
+  display: "grid",
+  gap: 14,
+};
+
+const timelineItemWrapStyle = {
+  position: "relative",
+  paddingLeft: 16,
+};
+
+const timelineDotStyle = {
+  width: 10,
+  height: 10,
+  borderRadius: "50%",
+  position: "absolute",
+  left: 0,
+  top: 3,
+  boxShadow: "0 0 14px rgba(255,255,255,0.12)",
+};
+
+const timelineTextStyle = {
+  paddingLeft: 6,
+};
+
+const timelineConnectorStyle = {
+  position: "absolute",
+  left: 4,
+  top: 16,
+  bottom: -16,
+  width: 2,
+  background: "linear-gradient(180deg, rgba(56,189,248,0.28), rgba(239,68,68,0.18))",
+};
+
+const subtleTagStyle = {
+  display: "inline-flex",
+  alignItems: "center",
+  padding: "5px 10px",
+  borderRadius: 999,
+  border: "1px solid rgba(148,163,184,0.18)",
+  color: "#94a3b8",
+  fontSize: 12,
 };
 
 const statCardStyle = {
@@ -529,116 +1163,29 @@ const statValueStyle = {
   fontSize: 19,
 };
 
-const gridStyle = {
-  display: "grid",
-  gridTemplateColumns: "1fr 1fr",
-  gap: 14,
-  marginBottom: 14,
-};
-
-const panelStyle = {
-  borderRadius: 16,
-  border: "1px solid rgba(148,163,184,0.2)",
-  background: "rgba(15,23,42,0.88)",
-  padding: 14,
-  minHeight: 250,
-  boxShadow: "0 14px 32px rgba(0,0,0,0.35)",
-};
-
-const resultCardStyle = {
+const endCardStyle = {
   borderRadius: 12,
-  border: "1px solid rgba(148,163,184,0.22)",
+  border: "1px solid rgba(148,163,184,0.18)",
   background: "rgba(2,6,23,0.9)",
   padding: 12,
   marginTop: 8,
 };
 
-const panelTitleStyle = {
-  marginTop: 0,
-  marginBottom: 10,
-  fontSize: 16,
-  letterSpacing: 0.2,
-};
-
-const inputRowStyle = {
-  display: "grid",
-  gap: 4,
-};
-
-const inputLabelStyle = {
+const errorStyle = {
   fontSize: 13,
-  color: "#9bb0d1",
+  color: "#f87171",
 };
 
-const inputStyle = {
-  borderRadius: 10,
-  border: "1px solid rgba(148,163,184,0.24)",
-  background: "#0f172a",
+const toggleStyle = {
+  border: "1px solid rgba(148,163,184,0.18)",
+  background: "rgba(15,23,42,0.84)",
   color: "#e2e8f0",
-  padding: "8px 10px",
-  fontSize: 14,
-};
-
-const primaryButtonStyle = {
-  border: 0,
   borderRadius: 10,
-  padding: "10px 12px",
-  cursor: "pointer",
-  color: "#ffffff",
-  background: "linear-gradient(135deg, #00a39a, #00c06f)",
-  fontWeight: 700,
-};
-
-const secondaryButtonStyle = {
-  borderRadius: 10,
-  border: "1px solid rgba(56,107,161,0.24)",
-  padding: "10px 12px",
-  cursor: "pointer",
-  color: "#dbeafe",
-  background: "#0b2447",
-  fontWeight: 700,
-};
-
-const logsContainerStyle = {
-  height: 450,
-  overflowY: "auto",
-  border: "1px solid rgba(148,163,184,0.2)",
-  borderRadius: 12,
-  padding: 10,
-  background: "#020617",
-};
-
-const logRowStyle = {
-  display: "flex",
-  gap: 8,
-  fontSize: 13,
-  marginBottom: 7,
-  alignItems: "baseline",
-};
-
-const logTimestampStyle = {
-  fontFamily: "JetBrains Mono, monospace",
-  minWidth: 84,
-};
-
-const mutedStyle = {
-  fontSize: 13,
-  color: "#94a3b8",
-};
-
-const statusStyle = {
-  fontSize: 22,
+  padding: "8px 12px",
   fontWeight: 800,
+  cursor: "pointer",
 };
 
-const meterOuterStyle = {
-  marginTop: 6,
-  height: 10,
-  borderRadius: 999,
-  background: "#1e293b",
-  overflow: "hidden",
-};
-
-const meterInnerStyle = {
-  height: "100%",
-};
+function NetworkBackdrop() {
+  return null;
+}

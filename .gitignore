@@ -49,5 +49,8 @@ dist/
 *.pkl
 *.keras
 *.pt
-model/
 downloads/
+
+# Track committed model bundle in this project
+!model/
+!model/**
