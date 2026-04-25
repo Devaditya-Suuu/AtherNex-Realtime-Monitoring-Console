@@ -701,6 +701,7 @@ async def internal_login(payload: InternalLoginRequest):
         username,
         "critical" if result["level"] == "HIGH RISK" else "warning" if result["level"] == "MEDIUM RISK" else "normal",
         f"Internal login check -> {result['level']} ({result['risk_score']})",
+        path="/internal/login",
         risk_score=result["risk_score"],
         level=result["level"],
         action=result["action"],
@@ -715,6 +716,7 @@ async def internal_login(payload: InternalLoginRequest):
             username,
             "critical",
             f"Account suspended after insider login anomaly (score={result['risk_score']})",
+            path="/internal/login",
         )
         return JSONResponse(status_code=403, content=result)
     return result
@@ -738,6 +740,7 @@ async def internal_download(payload: InternalDownloadRequest):
         username,
         "critical" if result["level"] == "HIGH RISK" else "warning" if result["level"] == "MEDIUM RISK" else "normal",
         f"Internal download check -> {result['level']} ({result['risk_score']})",
+        path="/internal/download",
         risk_score=result["risk_score"],
         level=result["level"],
         action=result["action"],
@@ -752,6 +755,7 @@ async def internal_download(payload: InternalDownloadRequest):
             username,
             "critical",
             f"Account suspended after suspicious download volume (score={result['risk_score']})",
+            path="/internal/download",
         )
         return JSONResponse(status_code=403, content=result)
     return result
@@ -775,6 +779,7 @@ async def internal_access(payload: InternalAccessRequest):
         username,
         "critical" if result["level"] == "HIGH RISK" else "warning" if result["level"] == "MEDIUM RISK" else "normal",
         f"Internal access check -> {result['level']} ({result['risk_score']})",
+        path="/internal/access",
         risk_score=result["risk_score"],
         level=result["level"],
         action=result["action"],
@@ -789,6 +794,7 @@ async def internal_access(payload: InternalAccessRequest):
             username,
             "critical",
             f"Account suspended after suspicious access behavior (score={result['risk_score']})",
+            path="/internal/access",
         )
         return JSONResponse(status_code=403, content=result)
     return result

@@ -213,7 +213,7 @@ function assessmentFromSecurityEvent(event) {
     };
   }
 
-  if (event.event_type === "auto_block" || event.event_type === "blocked_request") {
+  if (event.event_type === "auto_block") {
     return {
       status: "HIGH RISK",
       action: "BLOCK IP",
@@ -232,13 +232,14 @@ function assessmentFromSecurityEvent(event) {
   ) {
     const level = event.level || "LOW RISK";
     const status = level === "HIGH RISK" ? "HIGH RISK" : level === "MEDIUM RISK" ? "MEDIUM RISK" : "SAFE";
+    const path = event.path || "/internal/access";
     return {
       status,
       action: event.action || (level === "HIGH RISK" ? "SUSPEND ACCOUNT" : "MONITOR"),
       risk_score: Number(event.risk_score || (level === "HIGH RISK" ? 90 : level === "MEDIUM RISK" ? 55 : 20)),
       confidence: 1,
-      scenario: "insiderThreat",
-      route: getRouteForScenario("insiderThreat"),
+      scenario: scenarioFromPath(path),
+      route: routeForPath(path),
     };
   }
 
@@ -684,6 +685,7 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
   const liveFeedTimerRef = useRef(null);
   const lastEventEpochRef = useRef(0);
   const lastIncidentEpochRef = useRef(0);
+  const lastIncidentSampleRef = useRef("");
 
   const [scenario, setScenario] = useState("normal");
   const [liveMode, setLiveMode] = useState(true);
@@ -894,6 +896,7 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
         if (latest && latestAssessment && latestEpoch >= lastIncidentEpochRef.current) {
           lastIncidentEpochRef.current = latestEpoch;
           const latestRisk = Number(latestAssessment.risk_score || 0);
+          const sampleKey = `${latestEpoch}|${latest.event_type}|${latestAssessment.status}|${latestRisk}`;
           setScenario(latestAssessment.scenario);
           setPrediction({
             status: latestAssessment.status,
@@ -901,7 +904,10 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
             confidence: latestAssessment.confidence,
             risk_score: latestRisk,
           });
-          setRiskHistory((prev) => [...prev.slice(-49), { time: latest.timestamp || nowLabel(), risk: latestRisk }]);
+          if (sampleKey !== lastIncidentSampleRef.current) {
+            lastIncidentSampleRef.current = sampleKey;
+            setRiskHistory((prev) => [...prev.slice(-49), { time: latest.timestamp || nowLabel(), risk: latestRisk }]);
+          }
           setBreached((latestAssessment.status || "").includes("HIGH"));
 
           const route = latestAssessment.route;
@@ -925,10 +931,12 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
             activeScenario: "live",
           };
           setMetrics((prev) => {
-            setTrend({ ...prev });
+            const snapshot = { ...prev };
+            Promise.resolve().then(() => setTrend(snapshot));
             return next;
           });
         }
+        setError("");
       } catch (err) {
         setError(err.message || "Failed to sync live telemetry");
       }
@@ -1107,7 +1115,16 @@ export default function CyberMonitoringDashboard({ apiBaseUrl = "http://localhos
       </div>
 
       <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
-        <button type="button" style={toggleStyle} onClick={() => setLiveMode(true)}>
+        <button
+          type="button"
+          style={toggleStyle}
+          onClick={() => {
+            lastIncidentEpochRef.current = 0;
+            lastIncidentSampleRef.current = "";
+            setError("");
+            setLiveMode(true);
+          }}
+        >
           Use Real Traffic Mode
         </button>
         <button type="button" style={toggleStyle} onClick={() => setLiveMode(false)}>

@@ -26,7 +26,10 @@ from pydantic import BaseModel, Field
 TARGET_BASE_URL = os.getenv("TARGET_BASE_URL", "http://127.0.0.1:8001")
 ATTACKER_ID = os.getenv("ATTACKER_ID", "red-team-01")
 NORMAL_TRAFFIC_ID = os.getenv("NORMAL_TRAFFIC_ID", "normal-client-01")
+BROWSER_NORMAL_ID = "normal-browser-client"
 MAX_CONCURRENCY = 25
+# Large batches (brute 500, DDoS 900) need a generous timeout so runs finish reliably.
+HTTPX_TIMEOUT = 60.0
 
 app = FastAPI(title="AegisAI Red Team", version="1.0.0")
 
@@ -160,6 +163,31 @@ async def attacker_ui():
       'x-attacker-id': 'red-team-browser',
       'Content-Type': 'application/json'
     };
+    const BROWSER_NORMAL_ID = 'normal-browser-client';
+
+    function isSafeTarget(url) {
+      try {
+        const parsed = new URL(url);
+        const host = (parsed.hostname || '').toLowerCase();
+        return host === 'localhost' || host === '127.0.0.1';
+      } catch (_e) {
+        return false;
+      }
+    }
+
+    async function ensureNormalBrowserUnblocked(target) {
+      try {
+        const bl = await fetch(`${target}/security/blocklist`);
+        if (!bl.ok) return;
+        const data = await bl.json();
+        const blocked = data.blocked_sources || [];
+        if (blocked.includes(BROWSER_NORMAL_ID)) {
+          await fetch(`${target}/security/unblock/${encodeURIComponent(BROWSER_NORMAL_ID)}`, { method: 'POST' });
+        }
+      } catch (_e) {
+        /* ignore */
+      }
+    }
     const intensityMap = {
       1: { ddos: 160, brute: 90, sqli: 70, ports: 35, wave: 24, insiderDownload: 80, normalPing: 8, normalSearch: 5 },
       2: { ddos: 350, brute: 180, sqli: 120, ports: 60, wave: 40, insiderDownload: 200, normalPing: 12, normalSearch: 8 },
@@ -208,6 +236,10 @@ async def attacker_ui():
     }
 
     async function runBrowserAttack(kind, target) {
+      if (!target) throw new Error('Target URL is required');
+      if (!isSafeTarget(target)) {
+        throw new Error('Browser burst only allows http://localhost or http://127.0.0.1 targets for demo safety');
+      }
       const started = performance.now();
       const requests = [];
       const profile = selectedIntensity();
@@ -235,17 +267,20 @@ async def attacker_ui():
           requests.push({ url: `${target}/target/search?q=${q}`, options: { method: 'GET', headers: burstHeaders } });
         }
       } else if (kind === 'port-scan') {
-        const ports = Array.from({ length: profile.ports }, (_, i) => i + 75).concat([443, 8080, 3306, 5432, 6379]);
+        const basePorts = Array.from({ length: profile.ports }, (_, i) => i + 75);
+        const extraPorts = [443, 8080, 3306, 5432, 6379];
+        const ports = [...new Set([...basePorts, ...extraPorts])];
         for (const port of ports) {
           requests.push({ url: `${target}/target/ports/${port}`, options: { method: 'GET', headers: burstHeaders } });
         }
       } else if (kind === 'normal') {
-        for (let i = 0; i < profile.normalPing; i++) requests.push({ url: `${target}/target/ping`, options: { method: 'GET', headers: { 'x-attacker-id': 'normal-browser-client' } } });
-        for (let i = 0; i < profile.normalSearch; i++) requests.push({ url: `${target}/target/search?q=dashboard+view+${i}`, options: { method: 'GET', headers: { 'x-attacker-id': 'normal-browser-client' } } });
+        await ensureNormalBrowserUnblocked(target);
+        for (let i = 0; i < profile.normalPing; i++) requests.push({ url: `${target}/target/ping`, options: { method: 'GET', headers: { 'x-attacker-id': BROWSER_NORMAL_ID } } });
+        for (let i = 0; i < profile.normalSearch; i++) requests.push({ url: `${target}/target/search?q=dashboard+view+${i}`, options: { method: 'GET', headers: { 'x-attacker-id': BROWSER_NORMAL_ID } } });
         for (let i = 0; i < 4; i++) {
           requests.push({
             url: `${target}/target/login`,
-            options: { method: 'POST', headers: { 'x-attacker-id': 'normal-browser-client', 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'admin', password: 'aegis-safe-pass' }) }
+            options: { method: 'POST', headers: { 'x-attacker-id': BROWSER_NORMAL_ID, 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'admin', password: 'aegis-safe-pass' }) }
           });
         }
       } else if (kind === 'insider-after-hours') {
@@ -340,14 +375,32 @@ async def attacker_ui():
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ target_base_url: target })
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_e) {
+        data = { error: 'Invalid JSON from server', status: res.status, body: text.slice(0, 500) };
+      }
+      if (!res.ok) {
+        data = { ...data, http_status: res.status, ok: false };
+      }
       out.textContent = JSON.stringify(data, null, 2);
     }
 
     async function checkBlocklist() {
       const target = document.getElementById('target').value.trim();
       const res = await fetch('/check-blocklist?target_base_url=' + encodeURIComponent(target));
-      const data = await res.json();
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_e) {
+        data = { error: 'Invalid JSON from server', status: res.status, body: text.slice(0, 500) };
+      }
+      if (!res.ok) {
+        data = { ...data, http_status: res.status, ok: false };
+      }
       out.textContent = JSON.stringify(data, null, 2);
     }
   </script>
@@ -364,7 +417,7 @@ async def history():
 @app.get("/check-blocklist")
 async def check_blocklist(target_base_url: str = TARGET_BASE_URL):
     assert_safe_target(target_base_url)
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
         resp = await client.get(
             f"{target_base_url}/security/blocklist",
             headers={"x-attacker-id": ATTACKER_ID},
@@ -378,7 +431,7 @@ async def attack_insider_after_hours(req: AttackRequest):
     started = time.time()
     counts: dict[int, int] = {}
 
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": ATTACKER_ID}) as client:
         try:
             login = await client.post(
                 f"{req.target_base_url}/internal/login",
@@ -425,7 +478,7 @@ async def attack_insider_privilege_escalation(req: AttackRequest):
         for dept in departments
     ]
 
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": ATTACKER_ID}) as client:
         counts = await run_batch(client, requests_to_send)
         try:
             download = await client.post(
@@ -445,7 +498,7 @@ async def attack_insider_mass_exfiltration(req: AttackRequest):
     started = time.time()
     counts: dict[int, int] = {}
 
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": ATTACKER_ID}) as client:
         try:
             login = await client.post(
                 f"{req.target_base_url}/internal/login",
@@ -482,7 +535,7 @@ async def attack_brute_force(req: AttackRequest):
             )
         )
 
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": ATTACKER_ID}) as client:
         counts = await run_batch(client, requests_to_send)
 
     return summarize("brute-force", started, counts, len(requests_to_send))
@@ -513,7 +566,7 @@ async def attack_normal(req: AttackRequest):
         )
 
     counts: dict[int, int] = {}
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": NORMAL_TRAFFIC_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": NORMAL_TRAFFIC_ID}) as client:
         # Unblock the normal client id if a previous run happened to flag it.
         try:
             blocklist = await client.get(f"{req.target_base_url}/security/blocklist")
@@ -544,7 +597,7 @@ async def attack_ddos(req: AttackRequest):
     started = time.time()
     requests_to_send = [("GET", f"{req.target_base_url}/target/ping", None) for _ in range(900)]
 
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": ATTACKER_ID}) as client:
         counts = await run_batch(client, requests_to_send)
 
     return summarize("ddos", started, counts, len(requests_to_send))
@@ -565,7 +618,7 @@ async def attack_sql_injection(req: AttackRequest):
         q = payloads[i % len(payloads)] + str(random.randint(100, 999))
         requests_to_send.append(("GET", f"{req.target_base_url}/target/search?q={q}", None))
 
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": ATTACKER_ID}) as client:
         counts = await run_batch(client, requests_to_send)
 
     return summarize("sql-injection", started, counts, len(requests_to_send))
@@ -580,7 +633,7 @@ async def attack_port_scan(req: AttackRequest):
         ("GET", f"{req.target_base_url}/target/ports/{port}", None) for port in candidate_ports
     ]
 
-    async with httpx.AsyncClient(timeout=8.0, headers={"x-attacker-id": ATTACKER_ID}) as client:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, headers={"x-attacker-id": ATTACKER_ID}) as client:
         counts = await run_batch(client, requests_to_send)
 
     return summarize("port-scan", started, counts, len(requests_to_send))
